@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Primary SEO -->
+  <title>Automated DR Failover for Scale Computing HyperCore | Ansible Playbook</title>
+  <meta name="description" content="Open-source Ansible playbook that automatically detects HyperCore primary cluster failure and fails over replicated VMs to your DR site — no manual steps, no on-call engineer required.">
+  <meta name="keywords" content="HyperCore disaster recovery, Scale Computing DR, Ansible HyperCore, automated failover, HyperCore replication failover, HyperCore ansible collection, VM failover automation, scale computing ansible playbook, hypercore DR automation, edge computing disaster recovery">
+  <meta name="author" content="Scale Computing">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover">
+
+  <!-- Open Graph (LinkedIn, Slack, Teams previews) -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Automated DR Failover for Scale Computing HyperCore">
+  <meta property="og:description" content="Ansible playbook that detects HyperCore cluster failure and automatically clones + starts replicated VMs on your DR site. Zero manual steps.">
+  <meta property="og:url" content="https://github.com/ScaleComputing/hypercore-ansible-dr-failover">
+  <meta property="og:site_name" content="Scale Computing">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Automated DR Failover for Scale Computing HyperCore">
+  <meta name="twitter:description" content="Ansible playbook that detects HyperCore cluster failure and automatically clones + starts replicated VMs on your DR site.">
+
+  <!-- Structured Data: SoftwareApplication -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "HyperCore Ansible DR Failover",
+    "applicationCategory": "BusinessApplication",
+    "operatingSystem": "Linux, macOS, Windows (WSL2)",
+    "description": "Ansible playbook for automated disaster recovery failover on Scale Computing HyperCore. Monitors replication connection status, pings primary cluster nodes, and automatically clones and powers on replicated VMs when primary is unreachable.",
+    "softwareVersion": "1.0",
+    "license": "https://www.gnu.org/licenses/gpl-3.0",
+    "codeRepository": "https://github.com/ScaleComputing/hypercore-ansible-dr-failover",
+    "programmingLanguage": "YAML",
+    "author": {
+      "@type": "Organization",
+      "name": "Scale Computing",
+      "url": "https://www.scalecomputing.com"
+    },
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    }
+  }
+  </script>
+
+  <!-- Structured Data: HowTo -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "HowTo",
+    "name": "How to set up automated DR failover for HyperCore with Ansible",
+    "description": "Step-by-step guide to automating VM failover for Scale Computing HyperCore using Ansible.",
+    "totalTime": "PT30M",
+    "tool": [
+      { "@type": "HowToTool", "name": "Python 3.10+" },
+      { "@type": "HowToTool", "name": "Ansible-core 2.16+" },
+      { "@type": "HowToTool", "name": "scale_computing.hypercore Ansible collection" }
+    ],
+    "step": [
+      { "@type": "HowToStep", "name": "Install Ansible", "text": "Create a Python virtual environment and install ansible-core via pip." },
+      { "@type": "HowToStep", "name": "Install HyperCore collection", "text": "Run ansible-galaxy collection install -r requirements.yml." },
+      { "@type": "HowToStep", "name": "Configure inventory", "text": "Set your DR cluster IP and HyperCore credentials in inventory/inventory.yml." },
+      { "@type": "HowToStep", "name": "Test connectivity", "text": "Run ansible -m scale_computing.hypercore.cluster_info to verify API access." },
+      { "@type": "HowToStep", "name": "Schedule the playbook", "text": "Add a cron job or AWX schedule to run the playbook every 5 minutes." }
+    ]
+  }
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --blue: #0077cc;
+      --blue-dark: #005fa3;
+      --blue-light: #e8f4ff;
+      --dark: #111827;
+      --mid: #374151;
+      --light: #6b7280;
+      --border: #e5e7eb;
+      --green: #059669;
+      --bg: #ffffff;
+      --code-bg: #0d1117;
+      --code-green: #3fb950;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: var(--dark);
+      background: var(--bg);
+      line-height: 1.6;
+    }
+
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+
+    /* ── Nav ── */
+    nav {
+      border-bottom: 1px solid var(--border);
+      padding: 14px 0;
+      position: sticky;
+      top: 0;
+      background: white;
+      z-index: 100;
+    }
+    nav .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nav-brand { font-weight: 700; font-size: 1rem; color: var(--dark); }
+    .nav-links { display: flex; gap: 24px; font-size: 0.9rem; }
+    .btn {
+      display: inline-block;
+      padding: 8px 20px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn-primary { background: var(--blue); color: white; }
+    .btn-primary:hover { background: var(--blue-dark); text-decoration: none; }
+    .btn-outline { border: 1px solid var(--blue); color: var(--blue); }
+    .btn-outline:hover { background: var(--blue-light); text-decoration: none; }
+
+    /* ── Hero ── */
+    .hero {
+      background: linear-gradient(135deg, #0a1628 0%, #0d2444 60%, #0a1628 100%);
+      color: white;
+      padding: 80px 0 72px;
+      text-align: center;
+    }
+    .hero-eyebrow {
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #60a5fa;
+      margin-bottom: 16px;
+    }
+    .hero h1 {
+      font-size: clamp(1.8rem, 4vw, 2.8rem);
+      font-weight: 800;
+      line-height: 1.2;
+      margin-bottom: 20px;
+      max-width: 700px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .hero h1 span { color: #60a5fa; }
+    .hero p {
+      font-size: 1.1rem;
+      color: #cbd5e1;
+      max-width: 600px;
+      margin: 0 auto 36px;
+    }
+    .hero-cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+    .btn-hero {
+      padding: 13px 28px;
+      font-size: 1rem;
+      font-weight: 700;
+      border-radius: 8px;
+    }
+    .btn-hero-primary { background: #2563eb; color: white; }
+    .btn-hero-primary:hover { background: #1d4ed8; text-decoration: none; }
+    .btn-hero-secondary { background: rgba(255,255,255,0.1); color: white; border: 1px solid rgba(255,255,255,0.2); }
+    .btn-hero-secondary:hover { background: rgba(255,255,255,0.18); text-decoration: none; }
+
+    .hero-stat-bar {
+      display: flex;
+      justify-content: center;
+      gap: 48px;
+      margin-top: 52px;
+      padding-top: 40px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+      flex-wrap: wrap;
+    }
+    .hero-stat { text-align: center; }
+    .hero-stat .num { font-size: 2rem; font-weight: 800; color: #60a5fa; }
+    .hero-stat .label { font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.08em; }
+
+    /* ── Sections ── */
+    section { padding: 72px 0; }
+    section:nth-child(even) { background: #f9fafb; }
+    .section-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 10px;
+    }
+    h2 {
+      font-size: clamp(1.5rem, 3vw, 2rem);
+      font-weight: 800;
+      margin-bottom: 14px;
+      line-height: 1.25;
+    }
+    .section-intro {
+      font-size: 1.05rem;
+      color: var(--light);
+      max-width: 620px;
+      margin-bottom: 48px;
+    }
+
+    /* ── Problem / Solution ── */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+    @media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+
+    .card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px;
+    }
+    .card.red-top { border-top: 4px solid #ef4444; }
+    .card.green-top { border-top: 4px solid var(--green); }
+    .card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 16px; }
+    .card ul { list-style: none; }
+    .card ul li {
+      padding: 6px 0;
+      padding-left: 24px;
+      position: relative;
+      font-size: 0.95rem;
+      color: var(--mid);
+    }
+    .card.red-top ul li::before { content: "✕"; position: absolute; left: 0; color: #ef4444; font-weight: 700; }
+    .card.green-top ul li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+
+    /* ── How it works ── */
+    .phases { display: flex; flex-direction: column; gap: 0; }
+    .phase {
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+      padding: 24px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .phase:last-child { border-bottom: none; }
+    .phase-num {
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      font-weight: 800;
+      font-size: 0.9rem;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .phase-body h3 { font-size: 1rem; font-weight: 700; margin-bottom: 4px; }
+    .phase-body p { font-size: 0.9rem; color: var(--light); }
+    .phase-exit {
+      display: inline-block;
+      background: #fef3c7;
+      color: #92400e;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-top: 4px;
+    }
+    .phase-action {
+      display: inline-block;
+      background: #d1fae5;
+      color: #065f46;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-top: 4px;
+    }
+
+    /* ── Code block ── */
+    .code-block {
+      background: var(--code-bg);
+      border-radius: 10px;
+      padding: 28px 32px;
+      overflow-x: auto;
+    }
+    .code-block pre {
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 0.85rem;
+      line-height: 1.7;
+      color: var(--code-green);
+    }
+    .code-block .comment { color: #8b949e; }
+    .code-block .cmd { color: #79c0ff; }
+    .code-block .value { color: #ffa657; }
+
+    /* ── Feature grid ── */
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 24px;
+    }
+    .feature-card {
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+    }
+    .feature-icon {
+      font-size: 1.8rem;
+      margin-bottom: 12px;
+    }
+    .feature-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 6px; }
+    .feature-card p { font-size: 0.88rem; color: var(--light); }
+
+    /* ── Use cases ── */
+    .use-case-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 20px;
+    }
+    .use-case {
+      border-left: 3px solid var(--blue);
+      padding: 16px 20px;
+      background: white;
+      border-radius: 0 8px 8px 0;
+    }
+    .use-case h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 6px; }
+    .use-case p { font-size: 0.85rem; color: var(--light); }
+
+    /* ── Requirements ── */
+    .req-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+    }
+    .req-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 16px;
+      background: white;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .req-icon { font-size: 1.3rem; flex-shrink: 0; }
+    .req-item h4 { font-size: 0.9rem; font-weight: 700; margin-bottom: 2px; }
+    .req-item p { font-size: 0.8rem; color: var(--light); }
+
+    /* ── FAQ ── */
+    .faq { display: flex; flex-direction: column; gap: 0; }
+    .faq-item { border-bottom: 1px solid var(--border); padding: 20px 0; }
+    .faq-item h3 { font-size: 1rem; font-weight: 700; margin-bottom: 8px; }
+    .faq-item p { font-size: 0.92rem; color: var(--mid); }
+
+    /* ── CTA ── */
+    .cta-section {
+      background: linear-gradient(135deg, #0a1628, #0d2444);
+      color: white;
+      text-align: center;
+      padding: 80px 0;
+    }
+    .cta-section h2 { color: white; margin-bottom: 16px; }
+    .cta-section p { color: #94a3b8; margin-bottom: 36px; font-size: 1.05rem; }
+    .cta-buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+
+    /* ── Footer ── */
+    footer {
+      background: #0a1628;
+      color: #64748b;
+      text-align: center;
+      padding: 28px;
+      font-size: 0.85rem;
+    }
+    footer a { color: #64748b; }
+
+    @media (max-width: 640px) {
+      .nav-links { display: none; }
+      .hero { padding: 56px 0 48px; }
+      .hero-stat-bar { gap: 28px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Navigation ── -->
+<nav>
+  <div class="container">
+    <span class="nav-brand">HyperCore Ansible DR</span>
+    <div class="nav-links">
+      <a href="#how-it-works">How it works</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="#use-cases">Use cases</a>
+      <a href="#faq">FAQ</a>
+    </div>
+    <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover" class="btn btn-primary">View on GitHub</a>
+  </div>
+</nav>
+
+<!-- ── Hero ── -->
+<header class="hero">
+  <div class="container">
+    <p class="hero-eyebrow">Scale Computing HyperCore · Open Source · GPL-3.0</p>
+    <h1>Automated DR Failover for <span>HyperCore</span> with Ansible</h1>
+    <p>
+      When your primary cluster goes down, this playbook detects it and automatically
+      clones your replicated VMs on the DR site — no manual steps, no on-call engineer required.
+    </p>
+    <div class="hero-cta">
+      <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover" class="btn btn-hero btn-hero-primary">Get Started on GitHub</a>
+      <a href="#how-it-works" class="btn btn-hero btn-hero-secondary">See How It Works</a>
+    </div>
+    <div class="hero-stat-bar">
+      <div class="hero-stat">
+        <div class="num">&lt;2 min</div>
+        <div class="label">detection to VMs running</div>
+      </div>
+      <div class="hero-stat">
+        <div class="num">5 min</div>
+        <div class="label">typical check interval</div>
+      </div>
+      <div class="hero-stat">
+        <div class="num">0</div>
+        <div class="label">manual steps required</div>
+      </div>
+      <div class="hero-stat">
+        <div class="num">Free</div>
+        <div class="label">open source, GPL-3.0</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ── Problem / Solution ── -->
+<section>
+  <div class="container">
+    <p class="section-label">The Problem</p>
+    <h2>Manual DR failover fails when you need it most</h2>
+    <p class="section-intro">
+      Replication protects your data. But cloning VMs and bringing them online still requires
+      a human — and humans aren't available, alert, or fast at 3am.
+    </p>
+    <div class="two-col">
+      <div class="card red-top">
+        <h3>Without automation</h3>
+        <ul>
+          <li>Someone must notice the outage</li>
+          <li>Confirm it's real, not a blip</li>
+          <li>Log into the DR cluster manually</li>
+          <li>Find and clone each replicated VM</li>
+          <li>Power them on in the right order</li>
+          <li>Verify applications are running</li>
+          <li>Minutes to hours of downtime</li>
+        </ul>
+      </div>
+      <div class="card green-top">
+        <h3>With this playbook</h3>
+        <ul>
+          <li>Runs on a 5-minute schedule automatically</li>
+          <li>Uses multiple signals to confirm real failure</li>
+          <li>Clones all replicated VMs in one pass</li>
+          <li>Preserves MAC addresses for network continuity</li>
+          <li>Idempotent — safe to re-run indefinitely</li>
+          <li>Detection to VMs running in under 2 minutes</li>
+          <li>Works while everyone is asleep</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── How it works ── -->
+<section id="how-it-works">
+  <div class="container">
+    <p class="section-label">How It Works</p>
+    <h2>Multi-signal detection. Conservative by design.</h2>
+    <p class="section-intro">
+      The playbook never acts on a single indicator. Multiple independent checks must all
+      agree before failover is triggered — preventing false positives during network blips
+      or planned maintenance.
+    </p>
+    <div class="phases">
+      <div class="phase">
+        <div class="phase-num">1</div>
+        <div class="phase-body">
+          <h3>Check replication connection status</h3>
+          <p>Queries the HyperCore API via <code>remote_cluster_info</code>. If the connection shows <code>ESTABLISHED</code>, the primary is reachable.</p>
+          <span class="phase-exit">Exit — no failover needed</span>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-num">2</div>
+        <div class="phase-body">
+          <h3>Ping all primary cluster node IPs</h3>
+          <p>Node IPs are discovered dynamically from the replication record — no hardcoding. Each IP is pinged with configurable retries. If any node responds, the primary is still up.</p>
+          <span class="phase-exit">Exit — primary nodes reachable</span>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-num">2b</div>
+        <div class="phase-body">
+          <h3>Optional application-alive TCP check</h3>
+          <p>Configure an application endpoint at the primary site. If it responds on the configured port, failover is aborted — even if the replication link looks broken.</p>
+          <span class="phase-exit">Exit — application still responding</span>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-num">3</div>
+        <div class="phase-body">
+          <h3>Verify DR cluster health</h3>
+          <p>Pings all local DR cluster node IPs via <code>node_info</code>. A degraded DR cluster is not a safe target — abort rather than risk a bad failover.</p>
+          <span class="phase-exit">Abort — DR cluster not healthy</span>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-num">4</div>
+        <div class="phase-body">
+          <h3>Idempotency check</h3>
+          <p>Checks for VMs already tagged with <code>DR-failover</code>. If they exist, failover has already run — exit cleanly. Safe to leave the schedule running indefinitely.</p>
+          <span class="phase-exit">Exit — already failed over</span>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-num">5–6</div>
+        <div class="phase-body">
+          <h3>Clone + power on replicated VMs</h3>
+          <p>Clones every VM with a <code>replication_source_vm_uuid</code>, preserving MAC addresses for network identity continuity. Powers on all cloned VMs.</p>
+          <span class="phase-action">✓ DR Failover complete</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Quick start ── -->
+<section id="quickstart">
+  <div class="container">
+    <p class="section-label">Quick Start</p>
+    <h2>Up and running in 30 minutes</h2>
+    <p class="section-intro">
+      No prior Ansible experience required. See the full
+      <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover/blob/main/docs/GETTING_STARTED.md">Getting Started guide</a>
+      for detailed instructions including Windows (WSL2) setup.
+    </p>
+    <div class="code-block">
+      <pre><span class="comment"># 1. Install Ansible</span>
+python3 -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install -r requirements.txt
+ansible-galaxy collection install -r requirements.yml
+
+<span class="comment"># 2. Configure inventory (DR cluster IP + credentials)</span>
+cp inventory/inventory.example.yml inventory/inventory.yml
+<span class="comment"># edit inventory/inventory.yml</span>
+
+<span class="comment"># 3. Test connectivity</span>
+ansible -i inventory/inventory.yml all \
+  -m scale_computing.hypercore.cluster_info
+
+<span class="comment"># 4. Schedule (every 5 minutes via cron)</span>
+crontab -e
+<span class="value">*/5 * * * * cd /opt/hypercore-ansible-dr &amp;&amp; \
+  .venv/bin/ansible-playbook -i inventory/inventory.yml \
+  automated_dr_failover.yml &gt;&gt; /var/log/dr-failover.log 2&gt;&amp;1</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- ── Features ── -->
+<section>
+  <div class="container">
+    <p class="section-label">Features</p>
+    <h2>Built for production HyperCore environments</h2>
+    <p class="section-intro"></p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🔍</div>
+        <h3>Dynamic node discovery</h3>
+        <p>Primary cluster node IPs are fetched from the replication record — no hardcoded addresses to maintain.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔁</div>
+        <h3>Fully idempotent</h3>
+        <p>Safe to run on any schedule indefinitely. After failover, re-runs detect existing DR VMs and exit cleanly.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🌐</div>
+        <h3>Multiple source clusters</h3>
+        <p>Monitor all remote clusters or a specific named one. Node IPs from all disconnected clusters are checked.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🏷️</div>
+        <h3>VM exclusion tags</h3>
+        <p>Tag infrastructure VMs (DNS, NTP, monitoring) with <code>dr-exclude</code> to skip them during failover.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔒</div>
+        <h3>MAC address preservation</h3>
+        <p>Clones inherit the original VM's MAC addresses, maintaining network identity across DHCP and ARP.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🛟</div>
+        <h3>Partial failure recovery</h3>
+        <p>Block/rescue handles mid-failover errors cleanly, reporting exactly which VMs were cloned and which weren't.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">⚙️</div>
+        <h3>Fully configurable</h3>
+        <p>All detection parameters are variables with sensible defaults. Override at runtime with <code>-e</code>.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🧪</div>
+        <h3>Automated tests included</h3>
+        <p>15 unit tests validate all decision logic using mocked data — runnable without a live cluster.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Use cases ── -->
+<section id="use-cases">
+  <div class="container">
+    <p class="section-label">Use Cases</p>
+    <h2>Who is this for?</h2>
+    <p class="section-intro"></p>
+    <div class="use-case-grid">
+      <div class="use-case">
+        <h3>Edge computing / retail</h3>
+        <p>Remote sites with no on-site IT. Automatic failover means applications keep running without anyone physically present.</p>
+      </div>
+      <div class="use-case">
+        <h3>Manufacturing / OT environments</h3>
+        <p>Production-critical VMs (SCADA, MES, HMI) must recover immediately. Manual processes are too slow and too risky.</p>
+      </div>
+      <div class="use-case">
+        <h3>Healthcare</h3>
+        <p>Regulatory and patient safety requirements demand fast, documented, auditable failover with minimal downtime.</p>
+      </div>
+      <div class="use-case">
+        <h3>Financial services</h3>
+        <p>RTO and RPO commitments in the minutes range. Scheduled automation meets SLA requirements reliably.</p>
+      </div>
+      <div class="use-case">
+        <h3>MSPs / managed services</h3>
+        <p>Manage DR for multiple customer HyperCore environments from a single Ansible controller with per-cluster inventory.</p>
+      </div>
+      <div class="use-case">
+        <h3>Small IT teams</h3>
+        <p>No 24/7 on-call coverage? This ensures DR happens automatically even when no one is available to respond.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Requirements ── -->
+<section>
+  <div class="container">
+    <p class="section-label">Requirements</p>
+    <h2>What you need</h2>
+    <p class="section-intro"></p>
+    <div class="req-grid">
+      <div class="req-item">
+        <div class="req-icon">🖥️</div>
+        <div>
+          <h4>HyperCore ICOS v9.4+</h4>
+          <p>On both source and DR clusters</p>
+        </div>
+      </div>
+      <div class="req-item">
+        <div class="req-icon">🔗</div>
+        <div>
+          <h4>Replication configured</h4>
+          <p>VMs replicating from primary → DR via HyperCore Data Protection</p>
+        </div>
+      </div>
+      <div class="req-item">
+        <div class="req-icon">🐍</div>
+        <div>
+          <h4>Python 3.10+</h4>
+          <p>On the Ansible controller (Windows WSL2, macOS, or Linux)</p>
+        </div>
+      </div>
+      <div class="req-item">
+        <div class="req-icon">📦</div>
+        <div>
+          <h4>ansible-core 2.16+</h4>
+          <p>Installed via pip into a virtual environment</p>
+        </div>
+      </div>
+      <div class="req-item">
+        <div class="req-icon">🔌</div>
+        <div>
+          <h4>scale_computing.hypercore ≥ 1.3.0</h4>
+          <p>Ansible collection from Ansible Galaxy</p>
+        </div>
+      </div>
+      <div class="req-item">
+        <div class="req-icon">🌐</div>
+        <div>
+          <h4>Network access</h4>
+          <p>Controller → DR cluster port 443; controller → primary node IPs (ICMP)</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── FAQ ── -->
+<section id="faq">
+  <div class="container">
+    <p class="section-label">FAQ</p>
+    <h2>Frequently asked questions</h2>
+    <div class="faq">
+      <div class="faq-item">
+        <h3>Will it trigger a false failover during a network blip?</h3>
+        <p>No. The playbook requires both the HyperCore replication connection to show as disconnected <em>and</em> all primary cluster node IPs to fail ping after multiple retries. A brief network interruption will not meet both conditions simultaneously. You can further tune <code>ping_retries</code> and <code>ping_delay</code> for extra confidence.</p>
+      </div>
+      <div class="faq-item">
+        <h3>What happens if I run the playbook again after failover?</h3>
+        <p>Nothing. The playbook detects VMs already tagged with <code>DR-failover</code> and exits cleanly. It is designed to run on a continuous schedule — before, during, and after any failover event.</p>
+      </div>
+      <div class="faq-item">
+        <h3>Do I need Ansible experience to use this?</h3>
+        <p>No. The <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover/blob/main/docs/GETTING_STARTED.md">Getting Started guide</a> walks through everything from scratch, including Python setup for Windows (WSL2) and macOS users.</p>
+      </div>
+      <div class="faq-item">
+        <h3>Can I use this with multiple source clusters?</h3>
+        <p>Yes. The playbook monitors all remote cluster connections by default. Set <code>source_cluster_name</code> to limit monitoring to a specific cluster. Note: because the HyperCore API on the target does not expose which source cluster a replicated VM came from, all replicated VMs are cloned when any confirmed-down cluster is detected.</p>
+      </div>
+      <div class="faq-item">
+        <h3>Does it support failback?</h3>
+        <p>Not yet. Failback (returning VMs to the primary after it's restored) requires manual steps currently. It is documented in <code>IMPROVEMENTS.md</code> as a planned enhancement.</p>
+      </div>
+      <div class="faq-item">
+        <h3>Can I exclude certain VMs from failover?</h3>
+        <p>Yes. Set <code>dr_exclude_tag</code> to a tag name and apply that tag to any VM on the DR cluster that should be skipped — for example, shared infrastructure like DNS or NTP servers that run independently at both sites.</p>
+      </div>
+      <div class="faq-item">
+        <h3>Is this an official Scale Computing product?</h3>
+        <p>This is an open-source community project published by Scale Computing under the GPL-3.0 license. It is not a supported commercial product. Contributions, bug reports, and feature requests are welcome via GitHub Issues.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── CTA ── -->
+<section class="cta-section">
+  <div class="container">
+    <h2>Stop hoping someone is awake when the primary goes down</h2>
+    <p>Set up automated DR failover in 30 minutes. No Ansible experience required.</p>
+    <div class="cta-buttons">
+      <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover" class="btn btn-hero btn-hero-primary">Get Started on GitHub</a>
+      <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover/blob/main/docs/GETTING_STARTED.md" class="btn btn-hero btn-hero-secondary">Read the Guide</a>
+    </div>
+  </div>
+</section>
+
+<!-- ── Footer ── -->
+<footer>
+  <p>
+    <a href="https://github.com/ScaleComputing/hypercore-ansible-dr-failover">hypercore-ansible-dr-failover</a>
+    · Open source under GPL-3.0
+    · <a href="https://www.scalecomputing.com">Scale Computing</a>
+    · <a href="https://github.com/ScaleComputing/HyperCoreAnsibleCollection">HyperCore Ansible Collection</a>
+  </p>
+</footer>
+
+</body>
+</html>
