@@ -1,0 +1,3 @@
+collections:
+  - name: scale_computing.hypercore
+    version: ">=1.3.0"  # 1.3.0+ required for replication_source_vm_uuid in vm_info

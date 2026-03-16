@@ -1,0 +1,30 @@
+---
+# inventory/inventory.example.yml
+#
+# Copy this file to inventory/inventory.yml and fill in your DR cluster details.
+# inventory/inventory.yml is excluded from git via .gitignore.
+#
+# The playbook connects to the HyperCore API at https://{{ inventory_hostname }},
+# so use the cluster management IP or FQDN as the host name.
+#
+# For production use, store scale_pass in Ansible Vault:
+#   ansible-vault encrypt_string 'your_password' --name 'scale_pass'
+
+all:
+  hosts:
+
+    # Single DR cluster
+    10.0.0.100:
+      scale_user: admin
+      scale_pass: "admin"   # replace with vault-encrypted value in production
+
+    # Multiple DR clusters (each monitors its own replication source independently)
+    # dr-cluster-charlotte:
+    #   ansible_host: 10.1.0.100
+    #   scale_user: admin
+    #   scale_pass: "admin"
+    #
+    # dr-cluster-denver:
+    #   ansible_host: 10.2.0.100
+    #   scale_user: admin
+    #   scale_pass: "admin"

@@ -1,0 +1,9 @@
+.venv*
+*.retry
+workdir
+*.log
+vault_pass.txt
+*.vault
+inventory/inventory.yml
+inventory/*.yml
+!inventory/inventory.example.yml
