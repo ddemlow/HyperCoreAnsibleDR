@@ -1,0 +1,376 @@
+---
+# automated_dr_failover.yml
+#
+# Automated DR Failover for Scale Computing HyperCore
+#
+# Runs against the DR (target) cluster. Checks whether primary (source)
+# cluster(s) are unreachable, verifies the DR cluster is healthy, then
+# clones all replicated VMs and powers them on.
+#
+# Designed to be run on a schedule (e.g., every 5 minutes via cron/AWX).
+#
+# Phases:
+#   1. Check replication links — if all monitored clusters are ESTABLISHED, exit
+#   2. Ping all nodes of disconnected clusters — if any respond, exit (split-brain risk)
+#   3. Verify DR cluster nodes are reachable before proceeding
+#   4. Idempotency — skip if failover VMs already exist
+#   5. Clone all replicated VMs (excluding dr_exclude_tag), preserving MAC addresses
+#   6. Power on cloned VMs
+#
+# Required variables (set in inventory or extra-vars):
+#   scale_user   — HyperCore username (default: admin)
+#   scale_pass   — HyperCore password (default: admin)
+#
+# Optional variables (override defaults below):
+#   source_cluster_name  — Monitor only this named remote cluster.
+#                          Leave empty ("") to monitor ALL remote clusters.
+#                          NOTE: With multiple source clusters, all replicated VMs are
+#                          failed over regardless of which source cluster they came from,
+#                          because the HyperCore API on the target does not expose which
+#                          source cluster a replicated VM originated from.
+#   ping_retries         — Times to retry a ping before declaring a node down (default: 3)
+#   ping_delay           — Seconds between ping retries (default: 5)
+#   dr_vm_tag            — Tag applied to cloned failover VMs (default: DR-failover)
+#   dr_exclude_tag       — VMs with this tag are skipped during failover (default: "")
+#                          Useful for infrastructure VMs (DNS, NTP, monitoring) that
+#                          should not be auto-cloned.
+#   http_check_host      — Optional host TCP-checked as an application-alive signal.
+#                          If this host responds, failover is aborted regardless of
+#                          cluster connection status. (default: "")
+#   http_check_port      — TCP port for the application-alive check (default: 80)
+#
+# Usage:
+#   ansible-playbook automated_dr_failover.yml -i inventory/
+#   ansible-playbook automated_dr_failover.yml -i inventory/ \
+#     -e "source_cluster_name=primary-site dr_exclude_tag=dr-exclude"
+#
+# Known limitations / future enhancements:
+#   - Startup ordering: VMs are powered on in arbitrary order. A future enhancement
+#     could respect a user-defined startup sequence (e.g., DB before app before web).
+#     See: https://github.com/ScaleComputing/HyperCoreAnsibleCollection/issues (log there)
+#   - VM-to-source-cluster mapping: the HyperCore API on the target does not expose
+#     which source cluster each replicated VM came from, making per-cluster VM selection
+#     impossible without tagging VMs on the source before replication.
+#   - Graceful failover: shut down source VMs, wait for final snapshot to replicate,
+#     then clone — ensures zero data loss vs. cloning from last periodic snapshot.
+#   - Failback workflow: return DR VMs to primary once it is restored.
+#   - Post-failover health checks: TCP port test per VM to confirm app is ready.
+
+- name: Automated DR Failover - HyperCore
+  hosts: all
+  connection: ansible.builtin.local
+  gather_facts: false
+  strategy: host_pinned  # each DR cluster host proceeds independently
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_cluster_name: ""    # empty = monitor all remote clusters
+    ping_retries: 3             # retry attempts per node IP
+    ping_delay: 5               # seconds between retries
+    dr_vm_tag: "DR-failover"   # tag applied to all cloned VMs
+    dr_exclude_tag: ""          # VMs with this tag are skipped (e.g., "dr-exclude")
+    http_check_host: ""         # optional application-alive check host
+    http_check_port: 80
+
+  tasks:
+
+    # =========================================================
+    # PHASE 1: Check replication connection status
+    # Exit if all monitored clusters are still ESTABLISHED.
+    # =========================================================
+
+    - name: "[1/6] Get remote cluster connections"
+      scale_computing.hypercore.remote_cluster_info:
+      register: remote_clusters
+
+    - name: "[1/6] Fail if no remote clusters are configured"
+      ansible.builtin.fail:
+        msg: >
+          No remote cluster connections found on {{ inventory_hostname }}.
+          Configure replication before using this playbook.
+      when: remote_clusters.records | length == 0
+
+    - name: "[1/6] Identify clusters to monitor"
+      ansible.builtin.set_fact:
+        clusters_to_check: >-
+          {{
+            (remote_clusters.records
+              | selectattr('name', 'equalto', source_cluster_name)
+              | list)
+            if source_cluster_name != ''
+            else remote_clusters.records
+          }}
+
+    - name: "[1/6] Fail if source_cluster_name not found"
+      ansible.builtin.fail:
+        msg: >
+          source_cluster_name '{{ source_cluster_name }}' not found.
+          Available clusters: {{ remote_clusters.records | map(attribute='name') | list }}.
+          Check the name or leave source_cluster_name empty to monitor all clusters.
+      when:
+        - source_cluster_name != ''
+        - clusters_to_check | length == 0
+
+    - name: "[1/6] Identify disconnected clusters"
+      ansible.builtin.set_fact:
+        disconnected_clusters: >-
+          {{ clusters_to_check
+             | rejectattr('connection_status', 'equalto', 'ESTABLISHED')
+             | list }}
+
+    - name: "[1/6] Exit — all monitored clusters are ESTABLISHED (no failover needed)"
+      ansible.builtin.meta: end_host
+      when: disconnected_clusters | length == 0
+
+    - name: "[1/6] Disconnected cluster(s) detected — continuing checks"
+      ansible.builtin.debug:
+        msg: >
+          {{ disconnected_clusters | length }} disconnected cluster(s):
+          {{ disconnected_clusters
+             | map(attribute='name') | zip(
+               disconnected_clusters | map(attribute='connection_status'))
+             | map('join', ' → ') | list }}.
+          Verifying primary nodes are truly unreachable before proceeding.
+
+    # =========================================================
+    # PHASE 2: Ping all nodes of all disconnected clusters
+    # If any node from any disconnected cluster responds, abort —
+    # split-brain or partial failure is possible, too risky to proceed.
+    # =========================================================
+
+    - name: "[2/6] Collect node IPs from all disconnected clusters"
+      ansible.builtin.set_fact:
+        primary_node_ips: >-
+          {{ disconnected_clusters
+             | map(attribute='remote_node_ips')
+             | flatten | unique | list }}
+
+    - name: "[2/6] Fail if no node IPs available for disconnected clusters"
+      ansible.builtin.fail:
+        msg: >
+          No remote_node_ips found for disconnected cluster(s):
+          {{ disconnected_clusters | map(attribute='name') | list }}.
+          Cannot verify primary status via ping. Check cluster configuration.
+      when: primary_node_ips | length == 0
+
+    - name: "[2/6] Ping all disconnected cluster nodes ({{ ping_retries }} retries, {{ ping_delay }}s delay)"
+      ansible.builtin.command: ping -c 1 {{ item }}
+      register: primary_ping
+      loop: "{{ primary_node_ips }}"
+      loop_control:
+        label: "{{ item }}"
+      ignore_errors: true
+      changed_when: false
+      retries: "{{ ping_retries }}"
+      delay: "{{ ping_delay }}"
+      until: primary_ping.rc == 0  # retry while unreachable; stop as soon as node responds
+
+    - name: "[2/6] Exit — a primary node responded (split-brain risk, no failover)"
+      ansible.builtin.meta: end_host
+      when: primary_ping.results | selectattr('rc', 'equalto', 0) | list | length > 0
+
+    # Optional: abort if a known application endpoint is still alive
+    - name: "[2/6] Application-alive TCP check {{ http_check_host }}:{{ http_check_port }}"
+      ansible.builtin.wait_for:
+        host: "{{ http_check_host }}"
+        port: "{{ http_check_port }}"
+        timeout: 10
+      register: http_check_result
+      ignore_errors: true
+      when: http_check_host != ""
+
+    - name: "[2/6] Exit — application at {{ http_check_host }} is still responding (no failover needed)"
+      ansible.builtin.meta: end_host
+      when:
+        - http_check_host != ""
+        - not (http_check_result is skipped)
+        - http_check_result is not failed
+
+    - name: "[2/6] All primary node checks failed — primary appears to be offline"
+      ansible.builtin.debug:
+        msg: >
+          All {{ primary_ping.results | length }} node IP(s) across
+          {{ disconnected_clusters | length }} cluster(s) are unreachable
+          after {{ ping_retries }} retries. Proceeding to DR cluster health check.
+
+    # =========================================================
+    # PHASE 3: Verify DR cluster is healthy enough to proceed
+    # =========================================================
+
+    - name: "[3/6] Get DR cluster node information"
+      scale_computing.hypercore.node_info:
+      register: dr_nodes
+
+    - name: "[3/6] Ping DR cluster nodes to confirm local health"
+      ansible.builtin.command: ping -c 2 {{ item.lan_ip }}
+      register: dr_ping
+      loop: "{{ dr_nodes.records }}"
+      loop_control:
+        label: "{{ item.lan_ip }}"
+      ignore_errors: true
+      changed_when: false
+      retries: 2
+      delay: 3
+      until: dr_ping.rc == 0
+
+    - name: "[3/6] Abort — DR node {{ item.item.lan_ip }} is unreachable"
+      ansible.builtin.fail:
+        msg: >
+          DR cluster node {{ item.item.lan_ip }} did not respond to ping.
+          Cannot safely proceed — check local cluster health before attempting failover.
+      when: item.rc != 0
+      loop: "{{ dr_ping.results }}"
+      loop_control:
+        label: "{{ item.item.lan_ip }}"
+
+    # =========================================================
+    # PHASE 4: Idempotency, VM discovery, exclusion filtering
+    # =========================================================
+
+    - name: "[4/6] Get all VMs on DR cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_vms
+
+    - name: "[4/6] Check for existing DR failover VMs (idempotency)"
+      ansible.builtin.set_fact:
+        existing_dr_vms: >-
+          {{ all_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'string')
+             | selectattr('tags', 'search', dr_vm_tag)
+             | list }}
+
+    - name: "[4/6] Failover already performed — {{ existing_dr_vms | length }} DR VM(s) exist, exiting"
+      ansible.builtin.debug:
+        msg: >
+          Found {{ existing_dr_vms | length }} VM(s) already tagged '{{ dr_vm_tag }}':
+          {{ existing_dr_vms | map(attribute='vm_name') | list }}.
+          Failover has already run. Remove DR VMs or change dr_vm_tag to re-run.
+      when: existing_dr_vms | length > 0
+
+    - name: "[4/6] Exit — failover already performed"
+      ansible.builtin.meta: end_host
+      when: existing_dr_vms | length > 0
+
+    - name: "[4/6] Find replicated VMs (have a replication source)"
+      ansible.builtin.set_fact:
+        replicated_vms: >-
+          {{ all_vms.records
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | list }}
+
+    - name: "[4/6] Build exclusion list from dr_exclude_tag"
+      ansible.builtin.set_fact:
+        excluded_vm_names: >-
+          {{
+            (all_vms.records
+              | selectattr('tags', 'defined')
+              | selectattr('tags', 'string')
+              | selectattr('tags', 'search', dr_exclude_tag)
+              | map(attribute='vm_name') | list)
+            if dr_exclude_tag != ''
+            else []
+          }}
+
+    - name: "[4/6] Report excluded VMs"
+      ansible.builtin.debug:
+        msg: "Skipping {{ excluded_vm_names | length }} VM(s) excluded by tag '{{ dr_exclude_tag }}': {{ excluded_vm_names }}"
+      when: excluded_vm_names | length > 0
+
+    - name: "[4/6] Build final VM failover list"
+      ansible.builtin.set_fact:
+        vms_to_failover: >-
+          {{ replicated_vms
+             | rejectattr('vm_name', 'in', excluded_vm_names)
+             | list }}
+
+    - name: "[4/6] No replicated VMs to fail over on this DR cluster"
+      ansible.builtin.debug:
+        msg: >
+          No VMs with a replication source UUID found on {{ inventory_hostname }}
+          (after exclusions). Ensure replication is configured from the primary cluster.
+      when: vms_to_failover | length == 0
+
+    - name: "[4/6] Exit — nothing to fail over"
+      ansible.builtin.meta: end_host
+      when: vms_to_failover | length == 0
+
+    - name: "[4/6] VMs queued for failover"
+      ansible.builtin.debug:
+        msg: >
+          Initiating failover for {{ vms_to_failover | length }} VM(s):
+          {{ vms_to_failover | map(attribute='vm_name') | list }}
+
+    # =========================================================
+    # PHASE 5 + 6: Clone then power on
+    # block/rescue reports partial failures cleanly rather than
+    # aborting mid-way and leaving an inconsistent state.
+    # Name format: <source-name>-YYYY-MM-DD_HHMM-DR
+    # =========================================================
+
+    - name: "Clone and power on DR VMs"
+      block:
+
+        - name: "[5/6] Clone replicated VMs for DR failover"
+          scale_computing.hypercore.vm_clone:
+            source_vm_name: "{{ item.vm_name }}"
+            vm_name: "{{ item.vm_name }}-{{ '%Y-%m-%d_%H%M' | strftime }}-DR"
+            preserve_mac_address: true
+            tags:
+              - "{{ dr_vm_tag }}"
+          loop: "{{ vms_to_failover }}"
+          loop_control:
+            label: "{{ item.vm_name }}"
+          register: cloned_vms
+
+        - name: "[6/6] Power on cloned DR VMs"
+          scale_computing.hypercore.vm_params:
+            vm_name: "{{ item.invocation.module_args.vm_name }}"
+            power_state: start
+          when: item.changed | default(false)
+          loop: "{{ cloned_vms.results }}"
+          loop_control:
+            label: "{{ item.invocation.module_args.vm_name | default('unknown') }}"
+          register: powered_vms
+
+      rescue:
+        - name: "RESCUE — failover partially failed"
+          ansible.builtin.debug:
+            msg: >
+              One or more steps in the failover block failed on {{ inventory_hostname }}.
+              Failed task: {{ ansible_failed_task.name }}.
+              Error: {{ ansible_failed_result.msg | default('see output above') }}.
+              VMs that were cloned may still need to be powered on manually.
+
+        - name: "RESCUE — re-raise so play is marked failed"
+          ansible.builtin.fail:
+            msg: "DR failover block failed. See RESCUE output above for details."
+
+    # =========================================================
+    # SUMMARY
+    # =========================================================
+
+    - name: "DR Failover complete"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DR FAILOVER COMPLETE — {{ inventory_hostname }}
+          ============================================
+          Triggered by  : {{ disconnected_clusters | map(attribute='name') | list | join(', ') }}
+          VMs excluded  : {{ excluded_vm_names | join(', ') | default('none', true) }}
+          VMs cloned    : {{ cloned_vms.results | selectattr('changed') | list | length }} / {{ vms_to_failover | length }}
+          VMs powered on: {{ powered_vms.results | default([]) | selectattr('changed') | list | length }}
+          Cloned VM names:
+          {% for r in cloned_vms.results %}
+            - {{ r.invocation.module_args.vm_name }}
+          {% endfor %}
+          ============================================
+          Next steps to consider:
+            - Verify applications are responding on cloned VMs
+            - Update DNS / load balancer records if needed
+            - Notify on-call team
+          ============================================
