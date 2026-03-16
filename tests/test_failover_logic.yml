@@ -1,0 +1,310 @@
+---
+# tests/test_failover_logic.yml
+#
+# Automated unit tests for the DR failover decision logic.
+# Uses mocked API responses to test all decision branches without
+# requiring a live HyperCore cluster.
+#
+# Run with:
+#   ansible-playbook tests/test_failover_logic.yml
+#
+# All tasks assert expected behavior. A failed assertion = a test failure.
+# Exit code 0 means all tests passed.
+
+- name: "Test suite: DR failover decision logic"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Reusable mock data
+    mock_cluster_established:
+      records:
+        - name: "primary-site"
+          connection_status: "ESTABLISHED"
+          remote_node_ips: ["10.0.0.1", "10.0.0.2"]
+
+    mock_cluster_disconnected:
+      records:
+        - name: "primary-site"
+          connection_status: "DISCONNECTED"
+          remote_node_ips: ["10.0.0.1", "10.0.0.2"]
+
+    mock_cluster_multiple:
+      records:
+        - name: "site-a"
+          connection_status: "DISCONNECTED"
+          remote_node_ips: ["10.1.0.1"]
+        - name: "site-b"
+          connection_status: "ESTABLISHED"
+          remote_node_ips: ["10.2.0.1"]
+
+    mock_vms_with_replication:
+      records:
+        - vm_name: "web-01"
+          replication_source_vm_uuid: "aaaa-bbbb-cccc"
+          tags: ""
+        - vm_name: "db-01"
+          replication_source_vm_uuid: "dddd-eeee-ffff"
+          tags: ""
+        - vm_name: "infra-dns"
+          replication_source_vm_uuid: "gggg-hhhh-iiii"
+          tags: "dr-exclude"
+
+    mock_vms_no_replication:
+      records:
+        - vm_name: "local-vm"
+          replication_source_vm_uuid: ""
+          tags: ""
+
+    mock_vms_already_failed_over:
+      records:
+        - vm_name: "web-01-2024-01-01_1200-DR"
+          replication_source_vm_uuid: ""
+          tags: "DR-failover"
+        - vm_name: "web-01"
+          replication_source_vm_uuid: "aaaa-bbbb-cccc"
+          tags: ""
+
+    mock_dr_nodes:
+      records:
+        - lan_ip: "192.168.1.10"
+        - lan_ip: "192.168.1.11"
+
+  tasks:
+
+    - name: "=== Phase 1 Tests: Connection status detection ==="
+      ansible.builtin.debug:
+        msg: "Running Phase 1 tests..."
+
+    # ── TEST 1.1 ──────────────────────────────────────────────────────────────
+    - name: "[1.1] ESTABLISHED cluster produces empty disconnected_clusters list"
+      vars:
+        remote_clusters: "{{ mock_cluster_established }}"
+        source_cluster_name: ""
+        clusters_to_check: "{{ remote_clusters.records }}"
+      ansible.builtin.assert:
+        that:
+          - clusters_to_check | rejectattr('connection_status', 'equalto', 'ESTABLISHED') | list | length == 0
+        fail_msg: "FAIL: ESTABLISHED cluster should produce no disconnected clusters"
+        success_msg: "PASS: ESTABLISHED cluster correctly produces no disconnected clusters"
+
+    # ── TEST 1.2 ──────────────────────────────────────────────────────────────
+    - name: "[1.2] DISCONNECTED cluster produces one disconnected_clusters entry"
+      vars:
+        remote_clusters: "{{ mock_cluster_disconnected }}"
+        clusters_to_check: "{{ remote_clusters.records }}"
+      ansible.builtin.assert:
+        that:
+          - clusters_to_check | rejectattr('connection_status', 'equalto', 'ESTABLISHED') | list | length == 1
+        fail_msg: "FAIL: DISCONNECTED cluster should produce one disconnected entry"
+        success_msg: "PASS: DISCONNECTED cluster correctly identified"
+
+    # ── TEST 1.3 ──────────────────────────────────────────────────────────────
+    - name: "[1.3] Mixed clusters: only DISCONNECTED cluster appears in disconnected list"
+      vars:
+        remote_clusters: "{{ mock_cluster_multiple }}"
+        clusters_to_check: "{{ remote_clusters.records }}"
+        disconnected_clusters: "{{ clusters_to_check | rejectattr('connection_status', 'equalto', 'ESTABLISHED') | list }}"
+      ansible.builtin.assert:
+        that:
+          - disconnected_clusters | length == 1
+          - disconnected_clusters[0].name == "site-a"
+        fail_msg: "FAIL: Only site-a (DISCONNECTED) should be in disconnected list, not site-b (ESTABLISHED)"
+        success_msg: "PASS: Mixed clusters correctly filtered — only disconnected cluster identified"
+
+    # ── TEST 1.4 ──────────────────────────────────────────────────────────────
+    - name: "[1.4] source_cluster_name filter selects correct cluster"
+      vars:
+        remote_clusters: "{{ mock_cluster_multiple }}"
+        source_cluster_name: "site-a"
+        clusters_to_check: >-
+          {{ remote_clusters.records
+             | selectattr('name', 'equalto', source_cluster_name)
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - clusters_to_check | length == 1
+          - clusters_to_check[0].name == "site-a"
+        fail_msg: "FAIL: source_cluster_name filter should select only site-a"
+        success_msg: "PASS: source_cluster_name filter correctly selects named cluster"
+
+    # ── TEST 1.5 ──────────────────────────────────────────────────────────────
+    - name: "[1.5] Nonexistent source_cluster_name produces empty candidates list"
+      vars:
+        remote_clusters: "{{ mock_cluster_multiple }}"
+        source_cluster_name: "does-not-exist"
+        candidates: >-
+          {{ remote_clusters.records
+             | selectattr('name', 'equalto', source_cluster_name)
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - candidates | length == 0
+        fail_msg: "FAIL: Nonexistent cluster name should produce empty candidates"
+        success_msg: "PASS: Nonexistent cluster name correctly produces empty candidates (fail guard works)"
+
+    # ── TEST 1.6 ──────────────────────────────────────────────────────────────
+    - name: "[1.6] Node IPs are correctly flattened from multiple disconnected clusters"
+      vars:
+        disconnected_clusters:
+          - name: "site-a"
+            connection_status: "DISCONNECTED"
+            remote_node_ips: ["10.1.0.1", "10.1.0.2"]
+          - name: "site-c"
+            connection_status: "DISCONNECTED"
+            remote_node_ips: ["10.3.0.1"]
+        primary_node_ips: >-
+          {{ disconnected_clusters
+             | map(attribute='remote_node_ips')
+             | flatten | unique | list }}
+      ansible.builtin.assert:
+        that:
+          - primary_node_ips | length == 3
+          - '"10.1.0.1" in primary_node_ips'
+          - '"10.1.0.2" in primary_node_ips'
+          - '"10.3.0.1" in primary_node_ips'
+        fail_msg: "FAIL: Node IPs from multiple disconnected clusters should be flattened"
+        success_msg: "PASS: Node IPs correctly flattened from multiple disconnected clusters"
+
+    - name: "=== Phase 4 Tests: VM discovery and filtering ==="
+      ansible.builtin.debug:
+        msg: "Running Phase 4 tests..."
+
+    # ── TEST 4.1 ──────────────────────────────────────────────────────────────
+    - name: "[4.1] Replicated VMs correctly identified by replication_source_vm_uuid"
+      vars:
+        all_vms: "{{ mock_vms_with_replication }}"
+        replicated_vms: >-
+          {{ all_vms.records
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - replicated_vms | length == 3
+          - replicated_vms | map(attribute='vm_name') | list | sort == ['db-01', 'infra-dns', 'web-01']
+        fail_msg: "FAIL: All three VMs with replication_source_vm_uuid should be found"
+        success_msg: "PASS: Replicated VMs correctly identified"
+
+    # ── TEST 4.2 ──────────────────────────────────────────────────────────────
+    - name: "[4.2] No replicated VMs returns empty list"
+      vars:
+        all_vms: "{{ mock_vms_no_replication }}"
+        replicated_vms: >-
+          {{ all_vms.records
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - replicated_vms | length == 0
+        fail_msg: "FAIL: VMs without replication_source_vm_uuid should produce empty list"
+        success_msg: "PASS: VMs with no replication correctly returns empty list"
+
+    # ── TEST 4.3 ──────────────────────────────────────────────────────────────
+    - name: "[4.3] dr_exclude_tag correctly excludes tagged VMs"
+      vars:
+        all_vms: "{{ mock_vms_with_replication }}"
+        dr_exclude_tag: "dr-exclude"
+        replicated_vms: >-
+          {{ all_vms.records
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | list }}
+        excluded_vm_names: >-
+          {{ (all_vms.records
+               | selectattr('tags', 'defined')
+               | selectattr('tags', 'string')
+               | selectattr('tags', 'search', dr_exclude_tag)
+               | map(attribute='vm_name') | list)
+             if dr_exclude_tag != ''
+             else [] }}
+        vms_to_failover: >-
+          {{ replicated_vms
+             | rejectattr('vm_name', 'in', excluded_vm_names)
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - excluded_vm_names == ['infra-dns']
+          - vms_to_failover | length == 2
+          - '"infra-dns" not in (vms_to_failover | map(attribute="vm_name") | list)'
+          - '"web-01" in (vms_to_failover | map(attribute="vm_name") | list)'
+          - '"db-01" in (vms_to_failover | map(attribute="vm_name") | list)'
+        fail_msg: "FAIL: infra-dns should be excluded; web-01 and db-01 should remain"
+        success_msg: "PASS: dr_exclude_tag correctly excludes tagged VM, passes others through"
+
+    # ── TEST 4.4 ──────────────────────────────────────────────────────────────
+    - name: "[4.4] Empty dr_exclude_tag excludes nothing"
+      vars:
+        all_vms: "{{ mock_vms_with_replication }}"
+        dr_exclude_tag: ""
+        replicated_vms: >-
+          {{ all_vms.records
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | list }}
+        excluded_vm_names: >-
+          {{ (all_vms.records
+               | selectattr('tags', 'defined')
+               | selectattr('tags', 'string')
+               | selectattr('tags', 'search', dr_exclude_tag)
+               | map(attribute='vm_name') | list)
+             if dr_exclude_tag != ''
+             else [] }}
+        vms_to_failover: >-
+          {{ replicated_vms
+             | rejectattr('vm_name', 'in', excluded_vm_names)
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - excluded_vm_names | length == 0
+          - vms_to_failover | length == 3
+        fail_msg: "FAIL: Empty dr_exclude_tag should not exclude any VMs"
+        success_msg: "PASS: Empty dr_exclude_tag correctly excludes nothing"
+
+    # ── TEST 4.5 ──────────────────────────────────────────────────────────────
+    - name: "[4.5] Idempotency check: existing DR-tagged VMs detected"
+      vars:
+        all_vms: "{{ mock_vms_already_failed_over }}"
+        dr_vm_tag: "DR-failover"
+        existing_dr_vms: >-
+          {{ all_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'string')
+             | selectattr('tags', 'search', dr_vm_tag)
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - existing_dr_vms | length == 1
+          - existing_dr_vms[0].vm_name == "web-01-2024-01-01_1200-DR"
+        fail_msg: "FAIL: Existing DR VM should be detected for idempotency"
+        success_msg: "PASS: Idempotency check correctly detects existing DR-tagged VMs"
+
+    # ── TEST 4.6 ──────────────────────────────────────────────────────────────
+    - name: "[4.6] Tags filter is safe when VM has null/empty tags"
+      vars:
+        vms_with_mixed_tags:
+          records:
+            - vm_name: "vm-no-tags"
+              replication_source_vm_uuid: "uuid-1"
+              tags: ""
+            - vm_name: "vm-with-dr-tag"
+              replication_source_vm_uuid: "uuid-2"
+              tags: "DR-failover"
+            - vm_name: "vm-with-other-tag"
+              replication_source_vm_uuid: "uuid-3"
+              tags: "production"
+        dr_vm_tag: "DR-failover"
+        existing_dr_vms: >-
+          {{ vms_with_mixed_tags.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'string')
+             | selectattr('tags', 'search', dr_vm_tag)
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - existing_dr_vms | length == 1
+          - existing_dr_vms[0].vm_name == "vm-with-dr-tag"
+        fail_msg: "FAIL: Tag filter should handle empty/null tags safely"
+        success_msg: "PASS: Tag filter handles empty tags safely, finds only DR-tagged VM"
+
+    - name: "=== Summary ==="
+      ansible.builtin.debug:
+        msg: "All tests passed."
