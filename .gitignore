@@ -1,3 +1,6 @@
+draft_dr_exploration.yml
+*.pdf
+
 .venv*
 *.retry
 workdir
