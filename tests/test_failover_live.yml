@@ -1,0 +1,320 @@
+---
+# tests/test_failover_live.yml
+#
+# Live integration test for DR failover workflow.
+#
+# Requirements:
+#   - inventory has two groups: source and dr (or one host per group)
+#   - source cluster has a remote cluster configured for dr
+#   - scale_user/scale_pass set in inventory / vault
+#
+# Run with:
+#   ansible-playbook tests/test_failover_live.yml -i inventory/inventory.yml
+#
+# Optional extra-vars:
+#   source_cluster_name: (name of the connection on DR that identifies source cluster)
+#   dr_exclude_tag: (tag name used by automated_dr_failover to skip VMs; default dr-exclude)
+#   http_check_host: (optional app endpoint to prevent failover when alive)
+#   http_check_port: (default 80)
+#
+# Note: Test can be run with pre-existing VMs and replication already set up.
+# Use --start-at-task to skip initial setup if VMs/replication exist.
+
+- name: "DR failover live integration test - prepare source VMs and enable replication"
+  hosts: source
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+    dr_exclude_tag: "dr-exclude"
+    failover_playbook_path: "{{ playbook_dir }}/../automated_dr_failover.yml"
+    source_vms:
+      - name: "dr-live-test-keep"
+        tags: []
+      - name: "dr-live-test-exclude"
+        tags:
+          - "dr-exclude"
+    # note: use `remote_cluster_name` if you want an explicitly named remote cluster; otherwise first listed remote cluster is used
+    remote_cluster_name: ""
+
+  tasks:
+    - name: "Discover remote DR cluster connection on source"
+      scale_computing.hypercore.remote_cluster_info:
+      register: source_remote_cluster_info
+
+    - name: "Fail if no remote cluster connection is configured on source"
+      ansible.builtin.fail:
+        msg: "No remote cluster configured on source cluster; configure remote_cluster first."
+      when: source_remote_cluster_info.records | length == 0
+
+    - name: "Resolve target remote cluster name"
+      ansible.builtin.set_fact:
+        remote_cluster_name: >-
+          {{ remote_cluster_name
+             if remote_cluster_name | length > 0
+             else source_remote_cluster_info.records[0].name }}
+
+    - name: "Create and power on source test VMs"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.name }}"
+        description: "DR failover live test source VM"
+        state: present
+        memory: "{{ '256 MB' | human_to_bytes }}"
+        vcpu: 1
+        operating_system: os_other
+        disks:
+          - type: virtio_disk
+            disk_slot: 0
+            size: "{{ '1 GB' | human_to_bytes }}"
+        nics:
+          - type: virtio
+            vlan: 0
+        boot_devices:
+          - type: virtio_disk
+            disk_slot: 0
+        power_state: start
+        tags: "{{ item.tags }}"
+      loop: "{{ source_vms }}"
+      register: created_source_vms
+
+    - name: "Enable replication for source test VMs to target cluster"
+      scale_computing.hypercore.vm_replication:
+        vm_name: "{{ item.name }}"
+        remote_cluster: "{{ remote_cluster_name }}"
+        state: enabled
+      loop: "{{ source_vms }}"
+      register: source_replication
+
+    - name: "Wait for replication to be established (30 seconds)"
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: "Prompt user: replication established, ready to proceed"
+      ansible.builtin.pause:
+        prompt: |-
+          Replication established for all source VMs to '{{ remote_cluster_name }}'.
+          Initial snapshots should be replicating. Press Enter to continue monitoring on DR side.
+
+- name: "DR failover live integration test - verify source RPO and trigger DR playbook"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+    dr_exclude_tag: "dr-exclude"
+    source_cluster_name: ""  # set to cluster name if desired
+    http_check_host: ""      # set to non-empty to test http-check guard path
+    http_check_port: 80
+
+  tasks:
+    - name: "Wait for replicated VMs to appear on DR target"
+      scale_computing.hypercore.vm_info:
+      register: dr_vm_info_poll
+      until: >-
+        (dr_vm_info_poll.records
+         | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$')
+         | selectattr('replication_source_vm_uuid', 'ne', '')
+         | list | length) >= 2
+      retries: 60
+      delay: 10
+
+    - name: "Set list of replicated DR test VMs"
+      ansible.builtin.set_fact:
+        replicated_dr_test_vms: >-
+          {{ dr_vm_info_poll.records
+             | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$')
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | list }}
+
+    - name: "Assert we have replicated VMs on DR"
+      ansible.builtin.assert:
+        that:
+          - "replicated_dr_test_vms | length >= 2"
+        fail_msg: "No replicated VMs found on DR cluster. Ensure source cluster replication is active and wait until replication_target VMs appear."
+        success_msg: "Replicated VM(s) are visible on DR cluster."
+
+    - name: "Wait for initial replication snapshot to be ready on all replicated VMs (up to 10 minutes)"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: snapshot_check
+      loop: "{{ replicated_dr_test_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      until: snapshot_check.records | length > 0
+      retries: 120
+      delay: 5
+
+    - name: "Instruct operator to poweroff/disconnect source cluster before failover"
+      ansible.builtin.pause:
+        prompt: |-
+          Simulate source outage now by powering off/disconnecting source cluster.
+          Then press Enter to continue into automated failover.
+
+    - name: "Wait for remote cluster connection to be detected as disconnected (up to 2 minutes)"
+      scale_computing.hypercore.remote_cluster_info:
+      register: remote_cluster_status
+      until: >-
+        (remote_cluster_status.records
+         | selectattr('connection_status', 'ne', 'ESTABLISHED')
+         | list | length) > 0
+      retries: 24
+      delay: 5
+
+    - name: "Run automated DR failover playbook"
+      ansible.builtin.command: >-
+        ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
+        -i {{ ansible_inventory_sources[0] }}
+        -l {{ inventory_hostname }}
+        -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
+        -v
+      register: failover_run
+      changed_when: false
+
+    - name: "Show failover playbook stdout"
+      ansible.builtin.debug:
+        msg: "{{ failover_run.stdout }}"
+
+    - name: "Verify failover cloned DR VMs exist (happy path)"
+      scale_computing.hypercore.vm_info:
+      register: dr_info_after_failover
+
+    - name: "Analyze failover results"
+      ansible.builtin.set_fact:
+        cloned_keep_vms: >-
+          {{ dr_info_after_failover.records
+             | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-keep.*-DR$')
+             | list }}
+        cloned_exclude_vms: >-
+          {{ dr_info_after_failover.records
+             | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-exclude.*-DR$')
+             | list }}
+
+    - name: "Report test results"
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          DR FAILOVER TEST RESULTS
+          ============================================
+          Expected clones: 1 ({{ source_vm_prefix }}-keep)
+          Excluded VMs: 1 ({{ source_vm_prefix }}-exclude with tag '{{ dr_exclude_tag }}')
+
+          Actual clones created: {{ cloned_keep_vms | length + cloned_exclude_vms | length }}
+          - Keep VMs cloned: {{ cloned_keep_vms | length }} ({{ cloned_keep_vms | map(attribute='vm_name') | list | join(', ') | default('none') }})
+          - Excluded VMs cloned: {{ cloned_exclude_vms | length }} ({{ cloned_exclude_vms | map(attribute='vm_name') | list | join(', ') | default('none') }})
+
+          Test Status: {{ 'PASS' if (cloned_keep_vms | length >= 1 and cloned_exclude_vms | length == 0) else 'FAIL' }}
+          ============================================
+
+    - name: "Test evaluation and cleanup"
+      block:
+        - name: "Fail test if excluded VMs were cloned"
+          ansible.builtin.fail:
+            msg: "TEST FAILED: Excluded VM(s) were cloned when they should have been skipped!"
+          when: cloned_exclude_vms | length > 0
+
+        - name: "Fail test if expected VMs were not cloned"
+          ansible.builtin.fail:
+            msg: "TEST FAILED: Expected VM(s) were not cloned!"
+          when: cloned_keep_vms | length == 0
+
+        - name: "Prompt user: test passed, ready for cleanup"
+          ansible.builtin.pause:
+            prompt: |-
+              TEST PASSED: DR failover worked correctly.
+              - Expected VM cloned: ✓
+              - Excluded VM properly skipped: ✓
+
+              Ready to clean up test VMs. Please reconnect/power on the source cluster now.
+              Then press Enter to continue with cleanup.
+
+      rescue:
+        - name: "Prompt user: test failed, cleanup anyway?"
+          ansible.builtin.pause:
+            prompt: |-
+              TEST FAILED: Issues detected (see output above).
+              Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
+              Then press Enter to continue with cleanup, or Ctrl+C to abort.
+
+    - name: "Wait for remote cluster connection to be re-established (up to 2 minutes)"
+      scale_computing.hypercore.remote_cluster_info:
+      register: reconnect_status
+      until: >-
+        (reconnect_status.records
+         | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+         | list | length) > 0
+      retries: 24
+      delay: 5
+
+- name: "DR failover live integration test - cleanup source test VMs"
+  hosts: source
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+
+  tasks:
+    - name: "Discover all VMs on source cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_source_vms
+
+    - name: "Remove source test VMs"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ all_source_vms.records | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$') | list }}"
+      when: all_source_vms.records is defined
+
+- name: "DR failover live integration test - cleanup DR test VMs"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+
+  tasks:
+    - name: "Wait a moment for source cleanup to fully propagate"
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: "Discover all VMs on DR cluster for cleanup"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Clean up DR cloned VMs (with -DR suffix)"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ all_dr_vms.records | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*-DR$') | list }}"
+      when: all_dr_vms.records is defined
+
+    - name: "Clean up replication target VMs on DR cluster (without -DR suffix)"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ all_dr_vms.records | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$') | rejectattr('vm_name', 'match', '.*-DR$') | list }}"
+      when: all_dr_vms.records is defined
+

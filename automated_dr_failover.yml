@@ -45,6 +45,11 @@
 #     -e "source_cluster_name=primary-site dr_exclude_tag=dr-exclude"
 #
 # Known limitations / future enhancements:
+#   - Connection timeout detection: After source cluster is powered off/disconnected,
+#     it may take 1–2 minutes for the target DR cluster to detect the failure and update
+#     connection_status from ESTABLISHED to DISCONNECTED. This playbook does NOT wait for
+#     this timeout (to keep periodic runs fast). For test/manual failover scenarios, add a
+#     wait-for-disconnection phase (see tests/test_failover_live.yml for an example).
 #   - Startup ordering: VMs are powered on in arbitrary order. A future enhancement
 #     could respect a user-defined startup sequence (e.g., DB before app before web).
 #     See: https://github.com/ScaleComputing/HyperCoreAnsibleCollection/issues (log there)
@@ -269,8 +274,7 @@
           {{
             (all_vms.records
               | selectattr('tags', 'defined')
-              | selectattr('tags', 'string')
-              | selectattr('tags', 'search', dr_exclude_tag)
+              | selectattr('tags', 'contains', dr_exclude_tag)
               | map(attribute='vm_name') | list)
             if dr_exclude_tag != ''
             else []
