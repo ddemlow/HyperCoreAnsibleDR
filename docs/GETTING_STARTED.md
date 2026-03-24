@@ -409,5 +409,5 @@ ansible-playbook -i inventory/inventory.yml automated_dr_failover.yml \
 
 - Read `README.md` for a full reference of all variables and options
 - Read `MANUAL_TEST_PLAN.md` to validate your setup with a controlled failover test
-- Review `IMPROVEMENTS.md` to understand planned enhancements
+- Review `IMPROVEMENTS.md` for ideas on possible future enhancements
 - Open a GitHub Issue if you run into problems or have feature requests

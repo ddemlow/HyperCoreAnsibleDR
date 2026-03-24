@@ -352,7 +352,7 @@ You're set up. What's next?
 
 → MANUAL_TEST_PLAN.md  — validate with a controlled failover test
 → README.md            — full variable reference
-→ IMPROVEMENTS.md      — planned enhancements
+→ IMPROVEMENTS.md      — possible future enhancements
 
 github.com/ScaleComputing/hypercore-ansible-dr-failover
 ```
@@ -366,8 +366,8 @@ happens. The primary goes down, your VMs come up on DR — automatically.
 When you're ready to validate the setup, follow the manual test plan in `MANUAL_TEST_PLAN.md`
 for a step-by-step controlled failover test.
 
-The full README has a complete variable reference. And check `IMPROVEMENTS.md` for planned
-features including startup ordering, health checks, and failback automation.
+The full README has a complete variable reference. And check `IMPROVEMENTS.md` for ideas
+on possible future features including startup ordering, health checks, and failback automation.
 
 Thanks for watching.
 

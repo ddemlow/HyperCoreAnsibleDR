@@ -480,7 +480,7 @@ ok=14  changed=6  unreachable=0  failed=0
 
 ---
 
-# Planned Enhancements
+# Possible Enhancements
 
 | # | Feature | Value |
 |---|---|---|

@@ -167,7 +167,7 @@ cluster name before setting up replication, then use `dr_exclude_tag` to limit s
 ## What's Next
 
 The current playbook handles the most common scenario well: detect failure, clone, power on.
-The next planned enhancements focus on making the recovered environment production-ready faster:
+Some possible future enhancements could focus on making the recovered environment production-ready faster:
 
 - **Startup ordering** — power on database VMs before app servers before web tier, with
   configurable delays between groups

@@ -44,13 +44,13 @@
 #   ansible-playbook automated_dr_failover.yml -i inventory/ \
 #     -e "source_cluster_name=primary-site dr_exclude_tag=dr-exclude"
 #
-# Known limitations / future enhancements:
+# Known limitations / possible enhancements:
 #   - Connection timeout detection: After source cluster is powered off/disconnected,
 #     the target DR cluster may take 1–2 minutes to update connection_status from
 #     ESTABLISHED to DISCONNECTED. This playbook polls (up to disconnect_detect_retries
 #     × disconnect_detect_delay seconds) after confirming pings fail, so it does not
 #     proceed until the DR cluster has recognized the disconnection.
-#   - Startup ordering: VMs are powered on in arbitrary order. A future enhancement
+#   - Startup ordering: VMs are powered on in arbitrary order. A possible enhancement
 #     could respect a user-defined startup sequence (e.g., DB before app before web).
 #     See: https://github.com/ScaleComputing/HyperCoreAnsibleCollection/issues (log there)
 #   - VM-to-source-cluster mapping: the HyperCore API on the target does not expose
