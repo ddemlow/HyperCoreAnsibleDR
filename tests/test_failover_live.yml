@@ -195,12 +195,15 @@
           host: "{{ host_cluster.host }}"
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
-        vm_name: "{{ item.vm_name }}"
+        vm_name: "{{ item.0.vm_name }}"
         state: present
-        items: "{{ item.nics | json_query('[].{vlan: vlan, type: type}') | map('combine', {'connected': false}) | list }}"
-      loop: "{{ source_node_vms }}"
+        items:
+          - vlan: "{{ item.1.vlan }}"
+            type: "{{ item.1.type }}"
+            connected: false
+      loop: "{{ source_node_vms | subelements('nics') }}"
       loop_control:
-        label: "{{ item.vm_name }}"
+        label: "{{ item.0.vm_name }} vlan {{ item.1.vlan }}"
       when: auto_disconnect | bool
 
     - name: "Instruct operator to poweroff/disconnect source cluster before failover"
@@ -313,12 +316,15 @@
           host: "{{ host_cluster.host }}"
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
-        vm_name: "{{ item.vm_name }}"
+        vm_name: "{{ item.0.vm_name }}"
         state: present
-        items: "{{ item.nics | json_query('[].{vlan: vlan, type: type}') | map('combine', {'connected': true}) | list }}"
-      loop: "{{ source_node_vms }}"
+        items:
+          - vlan: "{{ item.1.vlan }}"
+            type: "{{ item.1.type }}"
+            connected: true
+      loop: "{{ source_node_vms | subelements('nics') }}"
       loop_control:
-        label: "{{ item.vm_name }}"
+        label: "{{ item.0.vm_name }} vlan {{ item.1.vlan }}"
       when: auto_disconnect | bool and source_node_vms is defined
 
     - name: "Wait for remote cluster connection to be re-established"
