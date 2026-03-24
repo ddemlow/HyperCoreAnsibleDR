@@ -46,10 +46,10 @@
 #
 # Known limitations / future enhancements:
 #   - Connection timeout detection: After source cluster is powered off/disconnected,
-#     it may take 1–2 minutes for the target DR cluster to detect the failure and update
-#     connection_status from ESTABLISHED to DISCONNECTED. This playbook does NOT wait for
-#     this timeout (to keep periodic runs fast). For test/manual failover scenarios, add a
-#     wait-for-disconnection phase (see tests/test_failover_live.yml for an example).
+#     the target DR cluster may take 1–2 minutes to update connection_status from
+#     ESTABLISHED to DISCONNECTED. This playbook polls (up to disconnect_detect_retries
+#     × disconnect_detect_delay seconds) after confirming pings fail, so it does not
+#     proceed until the DR cluster has recognized the disconnection.
 #   - Startup ordering: VMs are powered on in arbitrary order. A future enhancement
 #     could respect a user-defined startup sequence (e.g., DB before app before web).
 #     See: https://github.com/ScaleComputing/HyperCoreAnsibleCollection/issues (log there)
@@ -80,6 +80,10 @@
     dr_exclude_tag: ""          # VMs with this tag are skipped (e.g., "dr-exclude")
     http_check_host: ""         # optional application-alive check host
     http_check_port: 80
+    disconnect_detect_retries: 24  # retries waiting for DR to detect source disconnection
+    disconnect_detect_delay: 5     # seconds between disconnect-detection polls
+    snapshot_wait_retries: 120     # retries waiting for at least one replication snapshot per VM
+    snapshot_wait_delay: 5         # seconds between snapshot polls
 
   tasks:
 
@@ -200,7 +204,25 @@
         msg: >
           All {{ primary_ping.results | length }} node IP(s) across
           {{ disconnected_clusters | length }} cluster(s) are unreachable
-          after {{ ping_retries }} retries. Proceeding to DR cluster health check.
+          after {{ ping_retries }} retries. Waiting for DR cluster to confirm disconnection.
+
+    - name: "[2/6] Wait for DR cluster to detect source disconnection (up to {{ disconnect_detect_retries * disconnect_detect_delay }}s)"
+      scale_computing.hypercore.remote_cluster_info:
+      register: disconnect_wait
+      until: >-
+        (disconnect_wait.records
+         | selectattr('connection_status', 'ne', 'ESTABLISHED')
+         | list | length) > 0
+      retries: "{{ disconnect_detect_retries }}"
+      delay: "{{ disconnect_detect_delay }}"
+
+    - name: "[2/6] DR cluster confirmed disconnection from source"
+      ansible.builtin.debug:
+        msg: >
+          DR cluster now reports {{ disconnect_wait.records
+            | rejectattr('connection_status', 'equalto', 'ESTABLISHED')
+            | map(attribute='name') | list }} as disconnected.
+          Proceeding to DR cluster health check.
 
     # =========================================================
     # PHASE 3: Verify DR cluster is healthy enough to proceed
@@ -306,8 +328,20 @@
     - name: "[4/6] VMs queued for failover"
       ansible.builtin.debug:
         msg: >
-          Initiating failover for {{ vms_to_failover | length }} VM(s):
-          {{ vms_to_failover | map(attribute='vm_name') | list }}
+          Queued {{ vms_to_failover | length }} VM(s) for failover:
+          {{ vms_to_failover | map(attribute='vm_name') | list }}.
+          Waiting for at least one replication snapshot per VM before cloning.
+
+    - name: "[4/6] Wait for replication snapshot to exist on each VM (up to {{ snapshot_wait_retries * snapshot_wait_delay }}s per VM)"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: snapshot_wait
+      loop: "{{ vms_to_failover }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      until: snapshot_wait.records | length > 0
+      retries: "{{ snapshot_wait_retries }}"
+      delay: "{{ snapshot_wait_delay }}"
 
     # =========================================================
     # PHASE 5 + 6: Clone then power on

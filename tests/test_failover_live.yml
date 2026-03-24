@@ -91,15 +91,6 @@
       loop: "{{ source_vms }}"
       register: source_replication
 
-    - name: "Wait for replication to be established (30 seconds)"
-      ansible.builtin.pause:
-        seconds: 30
-
-    - name: "Prompt user: replication established, ready to proceed"
-      ansible.builtin.pause:
-        prompt: |-
-          Replication established for all source VMs to '{{ remote_cluster_name }}'.
-          Initial snapshots should be replicating. Press Enter to continue monitoring on DR side.
 
 - name: "DR failover live integration test - verify source RPO and trigger DR playbook"
   hosts: dr
@@ -145,7 +136,7 @@
         fail_msg: "No replicated VMs found on DR cluster. Ensure source cluster replication is active and wait until replication_target VMs appear."
         success_msg: "Replicated VM(s) are visible on DR cluster."
 
-    - name: "Wait for initial replication snapshot to be ready on all replicated VMs (up to 10 minutes)"
+    - name: "Wait for initial replication snapshot to be ready on all replicated VMs"
       scale_computing.hypercore.vm_snapshot_info:
         vm_name: "{{ item.vm_name }}"
       register: snapshot_check
@@ -162,7 +153,7 @@
           Simulate source outage now by powering off/disconnecting source cluster.
           Then press Enter to continue into automated failover.
 
-    - name: "Wait for remote cluster connection to be detected as disconnected (up to 2 minutes)"
+    - name: "Wait for remote cluster connection to be detected as disconnected"
       scale_computing.hypercore.remote_cluster_info:
       register: remote_cluster_status
       until: >-
@@ -247,7 +238,7 @@
               Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
               Then press Enter to continue with cleanup, or Ctrl+C to abort.
 
-    - name: "Wait for remote cluster connection to be re-established (up to 2 minutes)"
+    - name: "Wait for remote cluster connection to be re-established"
       scale_computing.hypercore.remote_cluster_info:
       register: reconnect_status
       until: >-
