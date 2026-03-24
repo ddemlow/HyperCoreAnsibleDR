@@ -1,0 +1,551 @@
+---
+# automated_dr_failback_cutover.yml
+#
+# DR Failback — Phase 4: shutdown DR VMs, wait for final shutdown snapshot to
+# replicate to source, clone with original names, power on, restore replication.
+#
+# Requires operator presence. Service outage on DR begins when this playbook runs.
+# Run only after automated_dr_failback_prepare.yml has completed with all VMs at 100%.
+#
+# Usage:
+#   ansible-playbook automated_dr_failback_cutover.yml -i inventory/inventory.yml
+#
+# Operator will be prompted for explicit "YES" confirmation before any destructive action.
+#
+# See docs/FAILBACK_DESIGN.md for full design notes.
+
+# ── Play 1: Pre-flight verification ──────────────────────────────────────────
+
+- name: "Failback Cutover — pre-flight verification"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+
+  tasks:
+    - name: "Verify source cluster connection is ESTABLISHED"
+      scale_computing.hypercore.remote_cluster_info:
+      register: remote_cluster_status
+
+    - name: "Fail if source cluster is not ESTABLISHED"
+      ansible.builtin.fail:
+        msg: >-
+          Source cluster connection is not ESTABLISHED from DR cluster {{ inventory_hostname }}.
+          Ensure the source cluster is online before starting cutover.
+      when: >-
+        (remote_cluster_status.records
+         | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+         | list | length) == 0
+
+    - name: "Get all VMs on DR cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Filter to DR failover VMs"
+      ansible.builtin.set_fact:
+        dr_failover_vms: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+        dr_failover_vm_uuids: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | map(attribute='uuid') | list }}
+
+    - name: "Fail if no DR failover VMs found"
+      ansible.builtin.fail:
+        msg: >-
+          No VMs tagged '{{ dr_vm_tag }}' found on DR cluster.
+          Run automated_dr_failback_prepare.yml first.
+      when: dr_failover_vms | length == 0
+
+    - name: "Check current replication progress"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: current_replication
+
+    - name: "Fail if any DR VM does not have 100% reverse replication"
+      ansible.builtin.fail:
+        msg: >-
+          Reverse replication is not at 100% for all DR failover VMs.
+          Run automated_dr_failback_prepare.yml and wait for 100% before cutover.
+
+          Current progress:
+          {% for rep in (current_replication.json | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids) | list) %}
+          - UUID {{ rep.virDomainUUID }}: {{ rep.progress.percentComplete }}%
+          {% endfor %}
+      when: >-
+        (current_replication.json
+         | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+         | list | length) < (dr_failover_vms | length)
+        or
+        (current_replication.json
+         | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+         | map(attribute='progress.percentComplete')
+         | list | min | default(0)) < 100
+
+    - name: "Verify replication target VMs exist on source"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/VirDomain"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: source_vms_check
+
+    - name: "Build list of -DR suffix replication target names expected on source"
+      ansible.builtin.set_fact:
+        expected_stub_names: "{{ dr_failover_vms | map(attribute='vm_name') | list }}"
+
+    - name: "Fail if replication target VMs not found on source"
+      ansible.builtin.fail:
+        msg: >-
+          Replication target VMs (with -DR suffix) not found on source cluster.
+          Expected: {{ expected_stub_names | join(', ') }}
+          Found on source: {{ source_vms_check.json | map(attribute='name') | select('match', dr_name_suffix_regex) | list | join(', ') }}
+          Run automated_dr_failback_prepare.yml first.
+      when: >-
+        (source_vms_check.json
+         | selectattr('name', 'in', expected_stub_names)
+         | list | length) < (dr_failover_vms | length)
+
+    - name: "Display pre-flight summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          FAILBACK CUTOVER — PRE-FLIGHT CHECK PASSED
+          ============================================================
+          DR cluster: {{ inventory_hostname }}
+          Source cluster: {{ groups['source'][0] }}
+          DR failover VMs to shut down: {{ dr_failover_vms | length }}
+
+          {% for vm in dr_failover_vms %}
+          - {{ vm.vm_name }} ({{ vm.power_state }})
+            → will be restored as: {{ vm.vm_name | regex_replace(dr_name_suffix_regex, '\1') }}
+          {% endfor %}
+
+          IMPORTANT: This playbook will:
+          1. SHUT DOWN the above VMs on the DR cluster (service outage begins)
+          2. Wait for a final shutdown snapshot to replicate to source
+          3. Clone those replicated VMs on source with their original names
+          4. Power on the source VMs
+          5. Re-enable forward replication (source → DR)
+
+          The outage window on DR begins at step 1 and ends when source VMs
+          are powered on in step 4.
+          ============================================================
+
+    - name: "Operator explicit YES confirmation before cutover"
+      ansible.builtin.pause:
+        prompt: |
+          Type YES (uppercase) to proceed with cutover. Anything else aborts.
+      register: operator_confirmation
+
+    - name: "Abort if operator did not type YES"
+      ansible.builtin.fail:
+        msg: "Cutover aborted — operator did not confirm with YES."
+      when: operator_confirmation.user_input | upper != "YES"
+
+
+# ── Play 2: Shutdown DR VMs + wait for final snapshot replication ─────────────
+
+- name: "Failback Cutover — shutdown and final snapshot replication"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    graceful_shutdown_retries: 30
+    graceful_shutdown_delay: 10
+    force_stop_after_graceful: true
+    snapshot_wait_retries: 60
+    snapshot_wait_delay: 10
+    final_replication_retries: 120
+    final_replication_delay: 10
+
+  tasks:
+    - name: "Get DR failover VMs"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Filter to DR failover VMs"
+      ansible.builtin.set_fact:
+        dr_failover_vms: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+        dr_failover_vm_uuids: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | map(attribute='uuid') | list }}
+
+    - name: "Gracefully shut down DR failover VMs (skip VMs already SHUTOFF)"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.vm_name }}"
+        power_state: shutdown
+      loop: "{{ dr_failover_vms | rejectattr('power_state', 'equalto', 'SHUTOFF') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    - name: "Wait for each DR failover VM to reach SHUTOFF"
+      scale_computing.hypercore.vm_info:
+        vm_name: "{{ item.vm_name }}"
+      register: shutdown_results
+      until: shutdown_results.records[0].power_state == 'SHUTOFF'
+      retries: "{{ graceful_shutdown_retries }}"
+      delay: "{{ graceful_shutdown_delay }}"
+      loop: "{{ dr_failover_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      ignore_errors: true
+
+    - name: "Force stop any DR VMs that did not shut down gracefully"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.item.vm_name }}"
+        power_state: stop
+      loop: "{{ shutdown_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name | default('unknown') }}"
+      when:
+        - force_stop_after_graceful | bool
+        - item.failed is defined and item.failed
+      register: force_stop_results
+
+    - name: "Wait for force-stopped VMs to reach SHUTOFF"
+      scale_computing.hypercore.vm_info:
+        vm_name: "{{ item.item.vm_name }}"
+      register: force_shutoff_poll
+      until: force_shutoff_poll.records[0].power_state == 'SHUTOFF'
+      retries: 12
+      delay: 5
+      loop: "{{ force_stop_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name | default('unknown') }}"
+      when: item.changed is defined and item.changed
+
+    - name: "Record pre-shutdown snapshot counts per DR failover VM"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: pre_shutdown_snapshots_raw
+      loop: "{{ dr_failover_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    - name: "Build pre-shutdown snapshot count map"
+      ansible.builtin.set_fact:
+        pre_shutdown_snapshot_counts: >-
+          {{ pre_shutdown_snapshot_counts | default({})
+             | combine({item.item.vm_name: item.records | length}) }}
+      loop: "{{ pre_shutdown_snapshots_raw.results }}"
+      loop_control:
+        label: "{{ item.item.vm_name }}"
+
+    - name: "Wait for shutdown snapshot to appear on each VM (count delta)"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: post_shutdown_snapshots
+      until: >-
+        (post_shutdown_snapshots.records | length) >
+        (pre_shutdown_snapshot_counts[item.vm_name] | int)
+      retries: "{{ snapshot_wait_retries }}"
+      delay: "{{ snapshot_wait_delay }}"
+      loop: "{{ dr_failover_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    - name: "Display snapshot detection result"
+      ansible.builtin.debug:
+        msg: |
+          Shutdown snapshots detected for all {{ dr_failover_vms | length }} DR failover VMs.
+          Waiting for shutdown snapshots to reach 100% replication on source...
+
+    - name: "Wait for shutdown snapshot to reach 100% replication on source"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: final_replication_poll
+      until: >-
+        (final_replication_poll.json
+         | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+         | list | length) == (dr_failover_vms | length)
+        and
+        (final_replication_poll.json
+         | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+         | map(attribute='progress.percentComplete')
+         | list | min | default(0)) == 100
+      retries: "{{ final_replication_retries }}"
+      delay: "{{ final_replication_delay }}"
+
+    - name: "Final snapshot replication complete"
+      ansible.builtin.debug:
+        msg: >-
+          Shutdown snapshot has fully replicated to source cluster for all
+          {{ dr_failover_vms | length }} VMs. Proceeding to clone on source.
+
+
+# ── Play 3: Clone on source + power on ───────────────────────────────────────
+
+- name: "Failback Cutover — clone on source and power on"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+
+  tasks:
+    - name: "Get all VMs on source cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_source_vms
+
+    - name: "Find replication target VMs on source (the -DR suffix stubs)"
+      ansible.builtin.set_fact:
+        source_stub_vms: >-
+          {{ all_source_vms.records
+             | selectattr('vm_name', 'match', dr_name_suffix_regex)
+             | list }}
+
+    - name: "Fail if no replication target stubs found on source"
+      ansible.builtin.fail:
+        msg: >-
+          No VMs matching the -DR suffix pattern found on source cluster.
+          Expected replication target stubs from reverse replication to be present.
+          Run automated_dr_failback_prepare.yml first.
+      when: source_stub_vms | length == 0
+
+    - name: "Display replication stubs to be cloned"
+      ansible.builtin.debug:
+        msg: |
+          Replication target stubs found on source: {{ source_stub_vms | length }}
+          {% for vm in source_stub_vms %}
+          - {{ vm.vm_name }}
+            → clone as: {{ vm.vm_name | regex_replace(dr_name_suffix_regex, '\1') }}
+          {% endfor %}
+
+    - name: "Clone each replication stub to its original name on source"
+      block:
+        - name: "Clone VM to original name"
+          scale_computing.hypercore.vm_clone:
+            vm_name: "{{ item.vm_name }}"
+            clone_name: "{{ item.vm_name | regex_replace(dr_name_suffix_regex, '\\1') }}"
+            preserve_mac_address: true
+            tags: []
+          loop: "{{ source_stub_vms }}"
+          loop_control:
+            label: "{{ item.vm_name }} → {{ item.vm_name | regex_replace(dr_name_suffix_regex, '\\1') }}"
+          register: clone_results
+          retries: 6
+          delay: 10
+          until: clone_results is not failed
+      rescue:
+        - name: "Report clone failures"
+          ansible.builtin.debug:
+            msg: |
+              CLONE FAILURES:
+              {% for result in clone_results.results | default([]) %}
+              {% if result.failed %}
+              - FAILED: {{ result.item.vm_name }} → {{ result.item.vm_name | regex_replace(dr_name_suffix_regex, '\\1') }}
+                Error: {{ result.msg | default('unknown') }}
+              {% endif %}
+              {% endfor %}
+
+              Successful clones:
+              {% for result in clone_results.results | default([]) %}
+              {% if not result.failed %}
+              - OK: {{ result.item.vm_name | regex_replace(dr_name_suffix_regex, '\\1') }}
+              {% endif %}
+              {% endfor %}
+        - name: "Fail play after reporting clone errors"
+          ansible.builtin.fail:
+            msg: "One or more VM clone operations failed. See output above."
+
+    - name: "Get newly cloned VMs on source"
+      scale_computing.hypercore.vm_info:
+      register: source_vms_after_clone
+
+    - name: "Build list of cloned VM names"
+      ansible.builtin.set_fact:
+        cloned_original_names: >-
+          {{ source_stub_vms
+             | map(attribute='vm_name')
+             | map('regex_replace', dr_name_suffix_regex, '\\1')
+             | list }}
+
+    - name: "Power on cloned VMs"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item }}"
+        power_state: start
+      loop: "{{ cloned_original_names }}"
+      loop_control:
+        label: "{{ item }}"
+      register: power_on_results
+      ignore_errors: true
+
+    - name: "Warn about any power-on failures (operator can power on manually)"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Power-on failed for {{ item.item }}. Power on manually after
+          verifying the VM is in a good state.
+      loop: "{{ power_on_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('unknown') }}"
+      when: item.failed is defined and item.failed
+
+    - name: "Display powered-on VMs"
+      ansible.builtin.debug:
+        msg: |
+          VMs cloned and powered on successfully on source cluster:
+          {% for result in power_on_results.results | default([]) %}
+          {% if not (result.failed | default(false)) %}
+          - {{ result.item }} — RUNNING
+          {% else %}
+          - {{ result.item }} — POWER-ON FAILED (manual action required)
+          {% endif %}
+          {% endfor %}
+
+    - name: "Operator application health check pause"
+      ansible.builtin.pause:
+        prompt: |
+          Source VMs have been cloned and powered on.
+
+          Please verify your applications are healthy on the source cluster before
+          continuing. Check:
+          - VMs are accessible via their IPs/hostnames
+          - Application services have started correctly
+          - Data integrity looks correct
+
+          When applications are confirmed healthy, press Enter to continue and
+          restore forward replication (source → DR).
+
+          If applications are NOT healthy, press Ctrl+C to abort. You will need
+          to investigate before proceeding.
+
+
+# ── Play 4: Restore forward replication (source → DR) ────────────────────────
+
+- name: "Failback Cutover — restore forward replication"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    restore_replication_enabled: true
+
+  tasks:
+    - name: "Resolve DR cluster name as seen from source"
+      scale_computing.hypercore.remote_cluster_info:
+      register: source_remote_clusters
+
+    - name: "Fail if no remote cluster configured on source"
+      ansible.builtin.fail:
+        msg: "No remote cluster configured on source. Cannot restore forward replication."
+      when: source_remote_clusters.records | length == 0
+
+    - name: "Resolve DR cluster name (first configured remote)"
+      ansible.builtin.set_fact:
+        dr_cluster_name: "{{ source_remote_clusters.records[0].name }}"
+
+    - name: "Get cloned VMs on source (original names, no -DR suffix)"
+      scale_computing.hypercore.vm_info:
+      register: all_source_vms
+
+    - name: "Identify restored VMs (those without -DR suffix that were just cloned)"
+      ansible.builtin.set_fact:
+        restored_source_vms: >-
+          {{ all_source_vms.records
+             | rejectattr('vm_name', 'match', dr_name_suffix_regex)
+             | rejectattr('vm_name', 'search', '^original-[0-9]')
+             | list }}
+
+    - name: "Enable forward replication for each restored source VM"
+      scale_computing.hypercore.vm_replication:
+        vm_name: "{{ item.vm_name }}"
+        remote_cluster: "{{ dr_cluster_name }}"
+        state: enabled
+      loop: "{{ restored_source_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: restore_replication_enabled | bool
+      ignore_errors: true
+      register: replication_restore_results
+
+    - name: "Report replication configuration status"
+      ansible.builtin.debug:
+        msg: |
+          Forward replication restore results:
+          {% for result in replication_restore_results.results | default([]) %}
+          - {{ result.item.vm_name }}: {{ 'OK' if not (result.failed | default(false)) else 'FAILED — configure manually' }}
+          {% endfor %}
+
+
+# ── Play 5: Cutover summary ───────────────────────────────────────────────────
+
+- name: "Failback Cutover — summary"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  vars:
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+
+  tasks:
+    - name: "Print cutover summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          FAILBACK CUTOVER COMPLETE
+          ============================================================
+          DR failover VMs have been shut down.
+          Source VMs have been cloned with their original names and powered on.
+          Forward replication (source → DR) has been re-enabled.
+
+          NEXT STEPS:
+          1. Verify all applications on source are healthy and stable.
+          2. Monitor forward replication to ensure it reaches 100%.
+          3. ONLY after confirming health, run the cleanup playbook to
+             permanently delete the DR failover VMs and replication stubs:
+
+               ansible-playbook automated_dr_failback_cleanup.yml \
+                 -i inventory/inventory.yml
+
+          WARNING: Do NOT run cleanup until you are certain source is healthy.
+          The DR failover VMs are your rollback option until cleanup is run.
+          ============================================================
