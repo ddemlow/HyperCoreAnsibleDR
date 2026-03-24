@@ -196,6 +196,7 @@
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
         vm_name: "{{ item.vm_name }}"
+        state: set
         items: "{{ item.nics | map('combine', {'connected': false}) | list }}"
       loop: "{{ source_node_vms }}"
       loop_control:
@@ -313,6 +314,7 @@
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
         vm_name: "{{ item.vm_name }}"
+        state: set
         items: "{{ item.nics | map('combine', {'connected': true}) | list }}"
       loop: "{{ source_node_vms }}"
       loop_control:
