@@ -190,17 +190,17 @@
       when: auto_disconnect | bool and (source_node_vms | default([]) | length == 0)
 
     - name: "Disconnect NIC on source cluster node VM to simulate outage"
-      scale_computing.hypercore.vm_nic:
-        cluster_instance:
-          host: "{{ host_cluster.host }}"
-          username: "{{ host_cluster.username }}"
-          password: "{{ host_cluster.password }}"
-        vm_name: "{{ source_node_vms[0].vm_name }}"
-        state: set
-        items:
-          - vlan: "{{ source_node_vms[0].nics[0].vlan }}"
-            type: "{{ source_node_vms[0].nics[0].type }}"
-            connected: false
+      ansible.builtin.uri:
+        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
+        method: PATCH
+        url_username: "{{ host_cluster.username }}"
+        url_password: "{{ host_cluster.password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          connected: false
+        status_code: 200
       when: auto_disconnect | bool
 
     - name: "Instruct operator to poweroff/disconnect source cluster before failover"
@@ -307,18 +307,18 @@
             msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
           when: auto_disconnect | bool
 
-    - name: "Reconnect NICs on source cluster node VMs"
-      scale_computing.hypercore.vm_nic:
-        cluster_instance:
-          host: "{{ host_cluster.host }}"
-          username: "{{ host_cluster.username }}"
-          password: "{{ host_cluster.password }}"
-        vm_name: "{{ source_node_vms[0].vm_name }}"
-        state: set
-        items:
-          - vlan: "{{ source_node_vms[0].nics[0].vlan }}"
-            type: "{{ source_node_vms[0].nics[0].type }}"
-            connected: true
+    - name: "Reconnect NIC on source cluster node VM"
+      ansible.builtin.uri:
+        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
+        method: PATCH
+        url_username: "{{ host_cluster.username }}"
+        url_password: "{{ host_cluster.password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          connected: true
+        status_code: 200
       when: auto_disconnect | bool and source_node_vms is defined
 
     - name: "Wait for remote cluster connection to be re-established"
