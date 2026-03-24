@@ -196,7 +196,7 @@
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
         vm_name: "{{ item.0.vm_name }}"
-        state: present
+        state: set  # set: replace NIC list — required to change connected flag
         items:
           - vlan: "{{ item.1.vlan }}"
             type: "{{ item.1.type }}"
@@ -317,7 +317,7 @@
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
         vm_name: "{{ item.0.vm_name }}"
-        state: present
+        state: set  # set: replace NIC list — required to change connected flag
         items:
           - vlan: "{{ item.1.vlan }}"
             type: "{{ item.1.type }}"
