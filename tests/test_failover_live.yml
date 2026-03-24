@@ -404,19 +404,78 @@
                 msg: "TEST PASSED. Reconnecting source cluster NICs and proceeding to cleanup."
               when: auto_disconnect | bool
 
-          rescue:
-            - name: "Prompt user: test failed, cleanup anyway?"
-              ansible.builtin.pause:
-                prompt: |-
-                  TEST FAILED: Issues detected (see output above).
-                  Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
-                  Then press Enter to continue with cleanup, or Ctrl+C to abort.
-              when: not (auto_disconnect | bool)
+        - name: "Idempotency check — re-run failover playbook with DR VMs already present"
+          block:
+            - name: "Re-run automated DR failover playbook (should be a no-op)"
+              ansible.builtin.command: >-
+                ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
+                -i {{ ansible_inventory_sources[0] }}
+                -l {{ inventory_hostname }}
+                -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
+                -v
+              register: idempotency_run
+              changed_when: false
 
-            - name: "Test failed — auto-reconnect will follow"
+            - name: "Show idempotency run stdout"
               ansible.builtin.debug:
-                msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
-              when: auto_disconnect | bool
+                msg: "{{ idempotency_run.stdout }}"
+
+            - name: "Get DR VMs after idempotency re-run"
+              scale_computing.hypercore.vm_info:
+              register: dr_info_after_idempotency
+
+            - name: "Analyze idempotency results"
+              ansible.builtin.set_fact:
+                cloned_keep_vms_after_rerun: >-
+                  {{ dr_info_after_idempotency.records
+                     | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-keep.*-DR$')
+                     | list }}
+                idempotency_message_found: >-
+                  {{ 'Failover has already run' in idempotency_run.stdout }}
+
+            - name: "Fail if idempotency re-run cloned additional VMs"
+              ansible.builtin.fail:
+                msg: >-
+                  IDEMPOTENCY FAILED: Re-running the failover playbook created additional
+                  DR VM clones. Expected {{ cloned_keep_vms | length }}, found
+                  {{ cloned_keep_vms_after_rerun | length }}.
+              when: cloned_keep_vms_after_rerun | length != cloned_keep_vms | length
+
+            - name: "Fail if idempotency message not found in output"
+              ansible.builtin.fail:
+                msg: >-
+                  IDEMPOTENCY FAILED: Expected 'Failover has already run' message not found
+                  in playbook output. The idempotency check may not have fired correctly.
+              when: not idempotency_message_found
+
+            - name: "Report idempotency result"
+              ansible.builtin.debug:
+                msg: |
+                  ============================================
+                  IDEMPOTENCY TEST RESULT: PASS
+                  ============================================
+                  Re-running failover playbook with DR VMs present produced no additional
+                  clones and correctly reported: 'Failover has already run.'
+                  ============================================
+
+          rescue:
+            - name: "Idempotency test failed — re-raise"
+              ansible.builtin.fail:
+                msg: "IDEMPOTENCY TEST FAILED. See output above."
+
+      rescue:
+        - name: "Prompt user: test failed, cleanup anyway?"
+          ansible.builtin.pause:
+            prompt: |-
+              TEST FAILED: Issues detected (see output above).
+              Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
+              Then press Enter to continue with cleanup, or Ctrl+C to abort.
+          when: not (auto_disconnect | bool)
+
+        - name: "Test failed — auto-reconnect will follow"
+          ansible.builtin.debug:
+            msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
+          when: auto_disconnect | bool
 
       always:
         - name: "Reconnect NIC on source cluster node VM"
