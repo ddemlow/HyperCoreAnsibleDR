@@ -298,6 +298,53 @@
           {{ host_cluster.host }}. Check host_cluster credentials and source_cluster_vm_name.
       when: auto_disconnect | bool and (source_node_vms | default([]) | length == 0)
 
+    - name: "Guard check — run failover playbook while source is still online (must be a no-op)"
+      block:
+        - name: "Run failover playbook with source cluster reachable"
+          ansible.builtin.command: >-
+            ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
+            -i {{ ansible_inventory_sources[0] }}
+            -l {{ inventory_hostname }}
+            -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
+            -v
+          register: guard_run
+          changed_when: false
+
+        - name: "Show guard run stdout"
+          ansible.builtin.debug:
+            msg: "{{ guard_run.stdout }}"
+
+        - name: "Get DR VMs after guard run"
+          scale_computing.hypercore.vm_info:
+          register: dr_info_after_guard
+
+        - name: "Analyze guard run results"
+          ansible.builtin.set_fact:
+            guard_dr_vms: >-
+              {{ dr_info_after_guard.records
+                 | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*-DR$')
+                 | list }}
+            guard_exited_early: >-
+              {{ 'ESTABLISHED' in guard_run.stdout or 'no failover needed' in guard_run.stdout | lower }}
+
+        - name: "Fail if guard run cloned any VMs"
+          ansible.builtin.fail:
+            msg: >-
+              GUARD CHECK FAILED: Failover playbook cloned {{ guard_dr_vms | length }} VM(s)
+              while the source cluster was still reachable. It should have exited without
+              making any changes.
+          when: guard_dr_vms | length > 0
+
+        - name: "Report guard check result"
+          ansible.builtin.debug:
+            msg: |
+              ============================================
+              GUARD CHECK RESULT: PASS
+              ============================================
+              Failover playbook exited without cloning any VMs while source
+              cluster was online and replication connection was ESTABLISHED.
+              ============================================
+
     - name: "Simulate outage, run failover, and restore connectivity"
       block:
         - name: "Disconnect NIC on source cluster node VM to simulate outage"
