@@ -171,17 +171,30 @@ ansible-playbook -i inventory/inventory.yml automated_dr_failover.yml \
   -e "dr_exclude_tag=dr-exclude"
 ```
 
-## Cleaning up after failover / failback
+## Failback — returning to the primary site
 
-The playbook is intentionally limited to the failover direction. After the primary site is
-restored:
+**This playbook handles failover only.** Failback is a separate, manual process that must
+be planned and executed carefully. The DR failover VMs have been running and accepting writes
+— deleting them before that data is safely replicated back to the primary will cause data loss.
 
-1. Power off and delete the DR failover VMs (those tagged `dr_vm_tag`)
-2. Verify replication has resumed and is current
-3. Re-run the playbook — it will exit cleanly on the idempotency check (primary `ESTABLISHED`, no DR VMs present)
+The high-level failback sequence is:
 
-Manual failback (returning DR VMs to the primary) is not automated in this playbook.
-See [Known limitations](#known-limitations).
+1. **Restore the primary site** — bring the primary cluster back online and confirm it is healthy
+2. **Set up reverse replication** — configure replication *from* the DR cluster (now running the live VMs) *back to* the primary cluster; this is the inverse of your original replication setup
+3. **Wait for sync** — allow replication to run until the primary copies are current with all writes made during the DR period; do not proceed until replication shows a healthy, recent snapshot
+4. **Schedule the cutover** — coordinate a maintenance window; the cutover will require a brief outage to ensure a clean final snapshot
+5. **Shut down DR VMs gracefully** — power off the DR failover VMs so no new writes occur after the final snapshot
+6. **Verify final replication** — confirm the last snapshot has landed on the primary
+7. **Start VMs on the primary** — power on the original VMs (or clones of the DR VMs) on the primary cluster
+8. **Validate application health** — verify applications are responding correctly before declaring failback complete
+9. **Clean up DR failover VMs** — once you are confident the primary is stable, delete the DR failover VMs (tagged `dr_vm_tag`) and remove the reverse replication configuration
+
+> **Warning:** Do not skip steps 2–6. Deleting the DR VMs before the data is replicated
+> back to the primary will permanently destroy any writes made during the DR period.
+
+After cleanup, this playbook's scheduled runs (if any) will resume normal monitoring —
+once replication from primary → DR is re-established and showing `ESTABLISHED`, the
+idempotency check will pass cleanly.
 
 ## Known limitations
 

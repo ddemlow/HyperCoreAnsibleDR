@@ -87,8 +87,8 @@ playbook checks for VMs already tagged with `DR-failover` before doing anything.
 it reports the situation and exits cleanly. Re-runs after a failover are no-ops.
 
 This makes it safe to leave the schedule running indefinitely — before, during, and after a
-real event. When the primary comes back and replication re-establishes, the schedule keeps
-running harmlessly.
+real event. Once you have completed failback (re-established replication from DR back to
+primary, synced, and cut over), the schedule resumes normal monitoring harmlessly.
 
 ## The Failover
 
@@ -185,7 +185,7 @@ Some possible future enhancements could focus on making the recovered environmen
 - **Notifications** — Slack, Teams, or email alert the moment failover fires (or is aborted)
 - **Replication lag monitoring** — surface RPO (recovery point objective) before committing
   to failover so operators know the data loss window
-- **Failback automation** — return VMs to primary once it's restored
+- **Failback automation** — return VMs to primary once it's restored; currently a manual process requiring reverse replication setup, sync verification, and a coordinated cutover window
 
 ## The Bigger Picture
 
