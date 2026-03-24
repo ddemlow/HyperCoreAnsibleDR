@@ -244,21 +244,54 @@ All 15 tasks should show `PASS` and the play should complete with `failed=0`.
 
 ---
 
-## Step 12 — Schedule the playbook
+## Step 12 — Decide how you will trigger failover
 
-For the playbook to be useful as a DR automation tool, it needs to run automatically on a
-schedule. Every 5 minutes is a typical interval — this means your maximum detection-to-
-failover time is around 5–6 minutes.
+There are two fundamentally different ways to use this playbook. Choose the one that matches
+your operating model.
 
-### Option A: cron (simple, runs on your controller machine)
+---
 
-Open the crontab editor:
+### Option A: Human-triggered runbook (recommended starting point)
+
+An operator runs the playbook after deciding a failover is warranted. This is the
+**recommended model for most teams** because:
+
+- Failover is high-impact and difficult to reverse
+- ICMP + replication status can transiently fail without indicating a real outage
+- A human sanity check is the most valuable signal in ambiguous failures
+
+When you have confirmed a disaster:
 
 ```
-crontab -e
+ansible-playbook -i inventory/inventory.yml automated_dr_failover.yml -v
 ```
 
-Add this line (adjust the path to match where you cloned the project):
+The playbook will verify the source cluster is unreachable before cloning anything — if the
+primary responds to a ping, it exits without making changes. This protects against accidental
+execution even in the human-triggered model.
+
+---
+
+### Option B: Scheduled / autonomous operation (advanced)
+
+Running on a cron schedule means the playbook decides when to fail over with no human in the
+loop. This requires additional safeguards before it is appropriate:
+
+- Persistent multi-signal failure detection (not a single observation)
+- Split-brain prevention so primary and DR VMs don't run simultaneously
+- Human alerting before or immediately after action
+- Validated failure scenarios so false positives don't trigger unintended failovers
+
+If those are in place, **AWX or Ansible Automation Platform** is preferable to raw cron —
+it provides execution history, notifications, and role-based access:
+
+1. Add this repository as a **Project** (point it at your git URL)
+2. Create an **Inventory** with your DR cluster host
+3. Create a **Job Template** pointing to `automated_dr_failover.yml`
+4. Add a **Schedule** to the Job Template (every 5 minutes is a common interval)
+5. Configure **Notifications** so the team is alerted on any execution
+
+If cron is the only option:
 
 ```
 */5 * * * * cd /home/youruser/hypercore-ansible-dr-failover && \
@@ -266,26 +299,10 @@ Add this line (adjust the path to match where you cloned the project):
   automated_dr_failover.yml >> /var/log/dr-failover.log 2>&1
 ```
 
-This runs the playbook every 5 minutes and appends output to a log file.
-
-Check it is working after a few minutes:
-
-```
-tail -f /var/log/dr-failover.log
-```
-
-### Option B: AWX or Ansible Automation Platform (recommended for production)
-
-AWX is the open-source web interface for Ansible. It provides scheduling, logging, role-based
-access control, and notifications. If your organization already has AWX or Ansible Automation
-Platform:
-
-1. Add this repository as a **Project** (point it at your git URL)
-2. Create an **Inventory** with your DR cluster host
-3. Create a **Job Template** pointing to `automated_dr_failover.yml`
-4. Add a **Schedule** to the Job Template: every 5 minutes
-
-AWX stores logs for every run, making it easy to see exactly what happened and when.
+> **Important:** Raw cron provides no alerting and no execution history beyond the log file.
+> Without split-brain fencing and human notification, autonomous failover carries real risk
+> of running DR VMs while the primary is still alive. Start with the human-triggered model
+> and move to scheduled operation only after validating your failure detection in lab tests.
 
 ---
 

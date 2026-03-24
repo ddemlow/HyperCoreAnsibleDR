@@ -1,12 +1,13 @@
-# Never Wake Up to a Dead Site: Automated DR Failover for HyperCore with Ansible
+# Your DR Plan Exists. Does Your DR Execution?
 
 Disaster recovery has a reputation problem. Every organization has a DR plan. Far fewer have
-a DR plan that actually works at 2am when the on-call engineer is half asleep and the primary
-site is completely dark.
+a DR plan that actually *works* at 2am when the on-call engineer is half asleep and the
+primary site is completely dark.
 
-The gap between "we have replication set up" and "our applications failed over automatically
-while everyone slept" is wider than most people realize. This post walks through an Ansible
-playbook that closes that gap for Scale Computing HyperCore environments.
+The gap between "we have replication set up" and "our applications are running on the DR
+cluster" is wider than most people realize — and it's not a replication problem. It's an
+execution problem. This post walks through an Ansible runbook that closes that gap for
+Scale Computing HyperCore environments.
 
 ## The Problem with Manual DR
 
@@ -27,17 +28,24 @@ someone still has to:
 In a real outage, under pressure, at an odd hour, with adrenaline running — this process
 takes time. Every minute of delay is downtime your users feel.
 
-## A Better Approach: Let Ansible Do It
+## A Better Approach: Consistent Execution, Human Decision
 
-The `automated_dr_failover` playbook runs on a schedule (every 5 minutes is typical) against
-your DR cluster. On each run it asks a simple question: *should I fail over right now?*
+The `automated_dr_failover` playbook is designed as a **human-triggered runbook**: when you
+decide a failover is warranted, you run it, and it executes every step correctly — no
+checklist, no forgotten tasks, no mistakes from stress or sleep deprivation.
 
-Most of the time the answer is no, and the playbook exits in seconds without touching anything.
-When the answer is yes — primary is genuinely unreachable, DR cluster is healthy, no failover
-has already happened — it acts.
+When you run it, the playbook asks a simple question: *is the primary actually unreachable?*
+If the answer is no, it exits without touching anything — protecting you from accidentally
+failing over when the primary is still alive. If the answer is yes, it acts.
 
-The whole decision process takes under a minute. VMs are cloned and running before most people
+The whole execution takes under a minute. VMs are cloned and running before most people
 would have even finished their first cup of coffee.
+
+> **What about fully automatic failover?** The playbook can run on a cron schedule, but
+> treating it as an autonomous system requires additional work: persistent multi-signal
+> failure detection, split-brain fencing, and human alerting. The runbook model — human
+> decides, automation executes — is the right starting point for most teams, and a clear
+> improvement over purely manual DR even without the automation layer.
 
 ## How the Detection Logic Works
 
@@ -121,20 +129,21 @@ all:
       scale_pass: "{{ vault_scale_pass }}"
 ```
 
-### 3. Schedule it
+### 3. Run it when you need it
 
-**Cron (every 5 minutes):**
+When you've confirmed the primary is down and a failover is warranted:
 
 ```
-*/5 * * * * cd /opt/hypercore-ansible-dr && \
-  .venv/bin/ansible-playbook -i inventory/inventory.yml \
-  automated_dr_failover.yml >> /var/log/dr-failover.log 2>&1
+ansible-playbook -i inventory/inventory.yml automated_dr_failover.yml -v
 ```
 
-**AWX / Ansible Automation Platform:**
+The playbook will verify the primary is unreachable before touching anything. If it isn't —
+if your ping to the primary nodes succeeds — the playbook exits without making changes.
+This is the safety check that makes it safe to run under pressure.
 
-Create a Job Template pointing to this playbook and set the schedule to run every 5 minutes.
-The playbook is idempotent so there's no risk in running it frequently.
+For teams that want scheduled / autonomous operation, see [the README](../README.md#scheduled--autonomous-operation)
+for what that requires. It's the right direction for mature DR programs, but the runbook
+model above is the right first step.
 
 ## Tuning for Your Environment
 
@@ -180,8 +189,13 @@ Some possible future enhancements could focus on making the recovered environmen
 
 ## The Bigger Picture
 
-Replication gives you the data. Automation gives you the recovery. Together they turn a DR
-plan from a document that lives in a drawer into a system that actually works when you need it.
+Replication gives you the data. A reliable runbook gives you the recovery. Together they turn
+a DR plan from a document that lives in a drawer into something that actually works when you
+need it — consistently, under pressure, at any hour.
+
+The human-triggered model might feel like a limitation compared to "fully automated," but it's
+the right tradeoff for most teams: you keep control of the highest-impact decision (declaring
+disaster), and Ansible handles everything else.
 
 The playbook is open source under the GPL-3.0 license and available at
 [github.com/ScaleComputing/hypercore-ansible-dr-failover](https://github.com/ScaleComputing/hypercore-ansible-dr-failover).

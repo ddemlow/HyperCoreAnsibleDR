@@ -8,7 +8,9 @@ treat them as a starting point for your own contributions or adaptations.
 
 ## 1. Failover notifications (HIGH impact / LOW effort)
 
-**Why first:** Without alerting, a failover can trigger silently at 3am and no one knows.
+**Why first:** In scheduled / autonomous mode, without alerting a failover can trigger
+silently at 3am and no one knows. In human-triggered runbook mode, notifications still add
+value — they create an audit trail and alert the broader team that a failover has occurred.
 The playbook already has a clean summary block — plugging in a notification is one task.
 
 Add a `notify_*` block at the end (and in the rescue block) that sends to one or more targets:

@@ -1,16 +1,27 @@
 # hypercore-ansible-dr-failover
 
-Ansible playbook for automated disaster recovery failover on Scale Computing HyperCore.
+Ansible runbook for executing disaster recovery failover on Scale Computing HyperCore.
 
 > **Disclaimer:** This project is provided as-is, without warranty of any kind. It is
 > intended as a starting point and reference implementation — test thoroughly in your own
 > environment and validate against your specific HyperCore version before relying on it
 > for production workloads.
 
-When run on a schedule, the playbook monitors the replication connection from a DR (target)
-cluster back to the primary (source) cluster. If the primary is confirmed unreachable, it
-automatically clones all replicated VMs on the DR cluster and powers them on — with no
-manual intervention required.
+When a human operator declares a disaster, this playbook executes the failover steps
+consistently and safely: it confirms the source cluster is unreachable, checks DR cluster
+health, then clones all replicated VMs and powers them on.
+
+**Primary operating model: human-triggered runbook.** An operator runs the playbook after
+deciding a failover is warranted. The playbook handles the execution; the human handles the
+decision. This is intentional — cloning and powering on DR VMs is a high-impact,
+difficult-to-reverse action, and ICMP + replication status alone are not a sufficient basis
+for autonomous execution in most environments.
+
+> **On scheduling:** The playbook *can* be run on a cron schedule for autonomous operation,
+> but this requires additional confidence — persistent multi-signal failure detection,
+> split-brain fencing, and human notification before or immediately after action. See
+> [Scheduled / autonomous operation](#scheduled--autonomous-operation) for what that
+> involves. For most teams, a human-triggered runbook is the right starting point.
 
 ## How it works
 
@@ -97,7 +108,7 @@ all disconnected clusters are pinged; if any respond, failover is aborted.
 
 ## Run
 
-### Manual run
+When you have decided a failover is warranted, run the playbook against your DR cluster:
 
 ```
 ansible-playbook -i inventory/inventory.yml automated_dr_failover.yml
@@ -117,18 +128,35 @@ ansible-playbook -i inventory/inventory.yml automated_dr_failover.yml \
   -l dr-cluster-charlotte
 ```
 
-### Scheduled execution (cron)
+The playbook will still verify the source cluster is unreachable before proceeding — it
+will not clone VMs if the primary is responding. This acts as a final safety check even in
+the human-triggered model.
 
-Run every 5 minutes via cron on the Ansible controller:
+## Scheduled / autonomous operation
 
-```
-*/5 * * * * cd /opt/hypercore-ansible-dr && .venv/bin/ansible-playbook \
-  -i inventory/inventory.yml automated_dr_failover.yml >> /var/log/dr-failover.log 2>&1
-```
+Running this playbook on a cron schedule turns it into an autonomous DR system — the
+playbook decides when to fail over with no human in the loop. That is a **fundamentally
+different operating model** with higher requirements:
 
-### Scheduled execution (AWX / Ansible Automation Platform)
+| Requirement | Why |
+|---|---|
+| Persistent multi-signal failure detection | ICMP + replication status can transiently fail; a single observation is not sufficient evidence of a real outage |
+| Split-brain prevention / fencing | Without it, both primary and DR VMs could run simultaneously and diverge |
+| Human alerting before or immediately after action | Failover should never be a surprise to the team |
+| Tested and validated failure scenarios | False positives have the same blast radius as real failovers |
 
-Create a Job Template pointing to this playbook. Set the schedule to run every 5 minutes.
+If these are in place, scheduled operation is reasonable. If not, a human-triggered runbook
+is safer and still eliminates most of the execution risk of manual DR procedures.
+
+**AWX / Ansible Automation Platform** is a better fit than raw cron for scheduled operation
+— it provides execution history, role-based access, and notification hooks that make
+autonomous operation more auditable:
+
+1. Add this repository as a **Project**
+2. Create an **Inventory** with your DR cluster host
+3. Create a **Job Template** pointing to `automated_dr_failover.yml`
+4. Add a **Schedule** and configure notification channels
+
 The playbook is idempotent — if failover has already occurred, it exits cleanly on the
 idempotency check without making any changes.
 
@@ -150,7 +178,7 @@ restored:
 
 1. Power off and delete the DR failover VMs (those tagged `dr_vm_tag`)
 2. Verify replication has resumed and is current
-3. The next scheduled run will exit cleanly (primary is `ESTABLISHED` again)
+3. Re-run the playbook — it will exit cleanly on the idempotency check (primary `ESTABLISHED`, no DR VMs present)
 
 Manual failback (returning DR VMs to the primary) is not automated in this playbook.
 See [Known limitations](#known-limitations).
