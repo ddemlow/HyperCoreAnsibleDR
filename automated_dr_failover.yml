@@ -364,6 +364,9 @@
           loop_control:
             label: "{{ item.vm_name }}"
           register: cloned_vms
+          retries: 6
+          delay: 10
+          until: cloned_vms is not failed
 
         - name: "[6/6] Power on cloned DR VMs"
           scale_computing.hypercore.vm_params:

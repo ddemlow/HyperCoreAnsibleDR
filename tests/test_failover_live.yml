@@ -20,6 +20,116 @@
 # Note: Test can be run with pre-existing VMs and replication already set up.
 # Use --start-at-task to skip initial setup if VMs/replication exist.
 
+- name: "DR failover live integration test - pre-flight: ensure source cluster connectivity"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "Pre-flight: discover source cluster node VMs on host cluster"
+      scale_computing.hypercore.vm_info:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+      register: host_cluster_vms
+      when: auto_disconnect | bool
+
+    - name: "Pre-flight: filter to source cluster node VMs"
+      ansible.builtin.set_fact:
+        source_node_vms: >-
+          {{ host_cluster_vms.records
+             | selectattr('vm_name', 'match', '^' + (source_cluster_vm_name
+                if (source_cluster_vm_name | default('') | length > 0)
+                else hostvars[groups['source'][0]]['hypercore_cluster_name']) + '.*$')
+             | list }}
+      when: auto_disconnect | bool
+
+    - name: "Pre-flight: reconnect NIC on each source cluster node VM (no-op if already connected)"
+      ansible.builtin.uri:
+        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ item.nics[0].uuid }}"
+        method: PATCH
+        url_username: "{{ host_cluster.username }}"
+        url_password: "{{ host_cluster.password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          connected: true
+        status_code: 200
+      loop: "{{ source_node_vms | default([]) }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: auto_disconnect | bool and (source_node_vms | default([]) | length > 0)
+
+    - name: "Pre-flight: wait for source cluster to be reachable"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/Cluster"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: source_reachable
+      until: source_reachable.status == 200
+      retries: 24
+      delay: 5
+      when: auto_disconnect | bool and (source_node_vms | default([]) | length > 0)
+
+- name: "DR failover live integration test - pre-test cleanup: source cluster"
+  hosts: source
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+
+  tasks:
+    - name: "Discover existing source test VMs"
+      scale_computing.hypercore.vm_info:
+      register: existing_source_vms
+
+    - name: "Delete existing source test VMs"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ existing_source_vms.records | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: cleanup_previous_run | default(true) | bool
+
+- name: "DR failover live integration test - pre-test cleanup: DR cluster"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+
+  tasks:
+    - name: "Discover existing DR test VMs"
+      scale_computing.hypercore.vm_info:
+      register: existing_dr_vms
+
+    - name: "Delete existing DR test VMs (replication targets and failover clones)"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ existing_dr_vms.records | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: cleanup_previous_run | default(true) | bool
+
 - name: "DR failover live integration test - prepare source VMs and enable replication"
   hosts: source
   connection: local
@@ -108,15 +218,11 @@
     source_cluster_name: ""  # set to cluster name if desired
     http_check_host: ""      # set to non-empty to test http-check guard path
     http_check_port: 80
+    # auto_disconnect and host_cluster come from inventory (dr group vars in test_inventory.yml).
     # Set auto_disconnect: true when the source cluster runs as a VM on a host cluster.
     # The test will disconnect/reconnect source node NICs automatically instead of
     # prompting the operator.  Override source_cluster_vm_name if the VM name on the
     # host cluster differs from the source inventory host's hypercore_cluster_name.
-    auto_disconnect: false
-    host_cluster:
-      host: "https://vfz31a-02.lab.local"
-      username: "admin"
-      password: "admin"
     source_cluster_vm_name: ""  # defaults to hypercore_cluster_name from source inventory
 
   tasks:
@@ -146,14 +252,17 @@
         fail_msg: "No replicated VMs found on DR cluster. Ensure source cluster replication is active and wait until replication_target VMs appear."
         success_msg: "Replicated VM(s) are visible on DR cluster."
 
-    - name: "Wait for initial replication snapshot to be ready on all replicated VMs"
-      scale_computing.hypercore.vm_snapshot_info:
-        vm_name: "{{ item.vm_name }}"
-      register: snapshot_check
-      loop: "{{ replicated_dr_test_vms }}"
-      loop_control:
-        label: "{{ item.vm_name }}"
-      until: snapshot_check.records | length > 0
+    - name: "Wait for all VM replication to reach 100% on source cluster"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/VirDomainReplication"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: replication_progress
+      until: >-
+        (replication_progress.json | length) >= (replicated_dr_test_vms | length) and
+        (replication_progress.json | map(attribute='progress.percentComplete') | list | min) == 100
       retries: 120
       delay: 5
 
@@ -189,147 +298,151 @@
           {{ host_cluster.host }}. Check host_cluster credentials and source_cluster_vm_name.
       when: auto_disconnect | bool and (source_node_vms | default([]) | length == 0)
 
-    - name: "Disconnect NIC on source cluster node VM to simulate outage"
-      ansible.builtin.uri:
-        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
-        method: PATCH
-        url_username: "{{ host_cluster.username }}"
-        url_password: "{{ host_cluster.password }}"
-        force_basic_auth: true
-        validate_certs: false
-        body_format: json
-        body:
-          connected: false
-        status_code: 200
-      when: auto_disconnect | bool
-
-    - name: "Instruct operator to poweroff/disconnect source cluster before failover"
-      ansible.builtin.pause:
-        prompt: |-
-          Simulate source outage now by powering off/disconnecting source cluster.
-          Then press Enter to continue into automated failover.
-      when: not (auto_disconnect | bool)
-
-    - name: "Wait for remote cluster connection to be detected as disconnected"
-      scale_computing.hypercore.remote_cluster_info:
-      register: remote_cluster_status
-      until: >-
-        (remote_cluster_status.records
-         | selectattr('connection_status', 'ne', 'ESTABLISHED')
-         | list | length) > 0
-      retries: 24
-      delay: 5
-
-    - name: "Run automated DR failover playbook"
-      ansible.builtin.command: >-
-        ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
-        -i {{ ansible_inventory_sources[0] }}
-        -l {{ inventory_hostname }}
-        -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
-        -v
-      register: failover_run
-      changed_when: false
-
-    - name: "Show failover playbook stdout"
-      ansible.builtin.debug:
-        msg: "{{ failover_run.stdout }}"
-
-    - name: "Verify failover cloned DR VMs exist (happy path)"
-      scale_computing.hypercore.vm_info:
-      register: dr_info_after_failover
-
-    - name: "Analyze failover results"
-      ansible.builtin.set_fact:
-        cloned_keep_vms: >-
-          {{ dr_info_after_failover.records
-             | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-keep.*-DR$')
-             | list }}
-        cloned_exclude_vms: >-
-          {{ dr_info_after_failover.records
-             | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-exclude.*-DR$')
-             | list }}
-
-    - name: "Report test results"
-      ansible.builtin.debug:
-        msg: |
-          ============================================
-          DR FAILOVER TEST RESULTS
-          ============================================
-          Expected clones: 1 ({{ source_vm_prefix }}-keep)
-          Excluded VMs: 1 ({{ source_vm_prefix }}-exclude with tag '{{ dr_exclude_tag }}')
-
-          Actual clones created: {{ cloned_keep_vms | length + cloned_exclude_vms | length }}
-          - Keep VMs cloned: {{ cloned_keep_vms | length }} ({{ cloned_keep_vms | map(attribute='vm_name') | list | join(', ') | default('none') }})
-          - Excluded VMs cloned: {{ cloned_exclude_vms | length }} ({{ cloned_exclude_vms | map(attribute='vm_name') | list | join(', ') | default('none') }})
-
-          Test Status: {{ 'PASS' if (cloned_keep_vms | length >= 1 and cloned_exclude_vms | length == 0) else 'FAIL' }}
-          ============================================
-
-    - name: "Test evaluation and cleanup"
+    - name: "Simulate outage, run failover, and restore connectivity"
       block:
-        - name: "Fail test if excluded VMs were cloned"
-          ansible.builtin.fail:
-            msg: "TEST FAILED: Excluded VM(s) were cloned when they should have been skipped!"
-          when: cloned_exclude_vms | length > 0
-
-        - name: "Fail test if expected VMs were not cloned"
-          ansible.builtin.fail:
-            msg: "TEST FAILED: Expected VM(s) were not cloned!"
-          when: cloned_keep_vms | length == 0
-
-        - name: "Prompt user: test passed, ready for cleanup"
-          ansible.builtin.pause:
-            prompt: |-
-              TEST PASSED: DR failover worked correctly.
-              - Expected VM cloned: ✓
-              - Excluded VM properly skipped: ✓
-
-              Ready to clean up test VMs. Please reconnect/power on the source cluster now.
-              Then press Enter to continue with cleanup.
-          when: not (auto_disconnect | bool)
-
-        - name: "Test passed — auto-reconnect will follow"
-          ansible.builtin.debug:
-            msg: "TEST PASSED. Reconnecting source cluster NICs and proceeding to cleanup."
+        - name: "Disconnect NIC on source cluster node VM to simulate outage"
+          ansible.builtin.uri:
+            url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
+            method: PATCH
+            url_username: "{{ host_cluster.username }}"
+            url_password: "{{ host_cluster.password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              connected: false
+            status_code: 200
           when: auto_disconnect | bool
 
-      rescue:
-        - name: "Prompt user: test failed, cleanup anyway?"
+        - name: "Instruct operator to poweroff/disconnect source cluster before failover"
           ansible.builtin.pause:
             prompt: |-
-              TEST FAILED: Issues detected (see output above).
-              Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
-              Then press Enter to continue with cleanup, or Ctrl+C to abort.
+              Simulate source outage now by powering off/disconnecting source cluster.
+              Then press Enter to continue into automated failover.
           when: not (auto_disconnect | bool)
 
-        - name: "Test failed — auto-reconnect will follow"
+        - name: "Wait for remote cluster connection to be detected as disconnected"
+          scale_computing.hypercore.remote_cluster_info:
+          register: remote_cluster_status
+          until: >-
+            (remote_cluster_status.records
+             | selectattr('connection_status', 'ne', 'ESTABLISHED')
+             | list | length) > 0
+          retries: 48
+          delay: 5
+
+        - name: "Run automated DR failover playbook"
+          ansible.builtin.command: >-
+            ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
+            -i {{ ansible_inventory_sources[0] }}
+            -l {{ inventory_hostname }}
+            -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
+            -v
+          register: failover_run
+          changed_when: false
+
+        - name: "Show failover playbook stdout"
           ansible.builtin.debug:
-            msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
+            msg: "{{ failover_run.stdout }}"
+
+        - name: "Verify failover cloned DR VMs exist (happy path)"
+          scale_computing.hypercore.vm_info:
+          register: dr_info_after_failover
+
+        - name: "Analyze failover results"
+          ansible.builtin.set_fact:
+            cloned_keep_vms: >-
+              {{ dr_info_after_failover.records
+                 | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-keep.*-DR$')
+                 | list }}
+            cloned_exclude_vms: >-
+              {{ dr_info_after_failover.records
+                 | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-exclude.*-DR$')
+                 | list }}
+
+        - name: "Report test results"
+          ansible.builtin.debug:
+            msg: |
+              ============================================
+              DR FAILOVER TEST RESULTS
+              ============================================
+              Expected clones: 1 ({{ source_vm_prefix }}-keep)
+              Excluded VMs: 1 ({{ source_vm_prefix }}-exclude with tag '{{ dr_exclude_tag }}')
+
+              Actual clones created: {{ cloned_keep_vms | length + cloned_exclude_vms | length }}
+              - Keep VMs cloned: {{ cloned_keep_vms | length }} ({{ cloned_keep_vms | map(attribute='vm_name') | list | join(', ') | default('none') }})
+              - Excluded VMs cloned: {{ cloned_exclude_vms | length }} ({{ cloned_exclude_vms | map(attribute='vm_name') | list | join(', ') | default('none') }})
+
+              Test Status: {{ 'PASS' if (cloned_keep_vms | length >= 1 and cloned_exclude_vms | length == 0) else 'FAIL' }}
+              ============================================
+
+        - name: "Test evaluation"
+          block:
+            - name: "Fail test if excluded VMs were cloned"
+              ansible.builtin.fail:
+                msg: "TEST FAILED: Excluded VM(s) were cloned when they should have been skipped!"
+              when: cloned_exclude_vms | length > 0
+
+            - name: "Fail test if expected VMs were not cloned"
+              ansible.builtin.fail:
+                msg: "TEST FAILED: Expected VM(s) were not cloned!"
+              when: cloned_keep_vms | length == 0
+
+            - name: "Prompt user: test passed, ready for cleanup"
+              ansible.builtin.pause:
+                prompt: |-
+                  TEST PASSED: DR failover worked correctly.
+                  - Expected VM cloned: ✓
+                  - Excluded VM properly skipped: ✓
+
+                  Ready to clean up test VMs. Please reconnect/power on the source cluster now.
+                  Then press Enter to continue with cleanup.
+              when: not (auto_disconnect | bool)
+
+            - name: "Test passed — auto-reconnect will follow"
+              ansible.builtin.debug:
+                msg: "TEST PASSED. Reconnecting source cluster NICs and proceeding to cleanup."
+              when: auto_disconnect | bool
+
+          rescue:
+            - name: "Prompt user: test failed, cleanup anyway?"
+              ansible.builtin.pause:
+                prompt: |-
+                  TEST FAILED: Issues detected (see output above).
+                  Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
+                  Then press Enter to continue with cleanup, or Ctrl+C to abort.
+              when: not (auto_disconnect | bool)
+
+            - name: "Test failed — auto-reconnect will follow"
+              ansible.builtin.debug:
+                msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
+              when: auto_disconnect | bool
+
+      always:
+        - name: "Reconnect NIC on source cluster node VM"
+          ansible.builtin.uri:
+            url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
+            method: PATCH
+            url_username: "{{ host_cluster.username }}"
+            url_password: "{{ host_cluster.password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              connected: true
+            status_code: 200
           when: auto_disconnect | bool
 
-    - name: "Reconnect NIC on source cluster node VM"
-      ansible.builtin.uri:
-        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
-        method: PATCH
-        url_username: "{{ host_cluster.username }}"
-        url_password: "{{ host_cluster.password }}"
-        force_basic_auth: true
-        validate_certs: false
-        body_format: json
-        body:
-          connected: true
-        status_code: 200
-      when: auto_disconnect | bool and source_node_vms is defined
-
-    - name: "Wait for remote cluster connection to be re-established"
-      scale_computing.hypercore.remote_cluster_info:
-      register: reconnect_status
-      until: >-
-        (reconnect_status.records
-         | selectattr('connection_status', 'equalto', 'ESTABLISHED')
-         | list | length) > 0
-      retries: 24
-      delay: 5
+        - name: "Wait for remote cluster connection to be re-established"
+          scale_computing.hypercore.remote_cluster_info:
+          register: reconnect_status
+          until: >-
+            (reconnect_status.records
+             | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+             | list | length) > 0
+          retries: 24
+          delay: 5
+          when: auto_disconnect | bool
 
 - name: "DR failover live integration test - cleanup source test VMs"
   hosts: source

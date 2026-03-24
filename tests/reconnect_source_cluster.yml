@@ -1,0 +1,74 @@
+---
+# tests/reconnect_source_cluster.yml
+#
+# Emergency recovery: reconnect source cluster node NICs on the host cluster.
+# Run this when a previous test_failover_live.yml run left the source cluster
+# disconnected (e.g. due to timeout or Ctrl+C before cleanup ran).
+#
+# Run with:
+#   ansible-playbook tests/reconnect_source_cluster.yml -i inventory/test_inventory.yml
+
+- name: "Reconnect source cluster node NICs on host cluster"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "Resolve source cluster VM name"
+      ansible.builtin.set_fact:
+        resolved_source_vm_name: >-
+          {{ source_cluster_vm_name
+             if (source_cluster_vm_name | default('') | length > 0)
+             else hostvars[groups['source'][0]]['hypercore_cluster_name'] }}
+
+    - name: "Discover all VMs on host cluster"
+      scale_computing.hypercore.vm_info:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+      register: host_cluster_vms
+
+    - name: "Filter to source cluster node VMs"
+      ansible.builtin.set_fact:
+        source_node_vms: >-
+          {{ host_cluster_vms.records
+             | selectattr('vm_name', 'match', '^' + resolved_source_vm_name + '.*$')
+             | list }}
+
+    - name: "Fail if no source cluster VMs found"
+      ansible.builtin.fail:
+        msg: >-
+          No VMs matching '{{ resolved_source_vm_name }}*' found on host cluster
+          {{ host_cluster.host }}. Check host_cluster credentials and source_cluster_vm_name.
+      when: source_node_vms | length == 0
+
+    - name: "Reconnect NIC on each source cluster node VM"
+      ansible.builtin.uri:
+        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ item.nics[0].uuid }}"
+        method: PATCH
+        url_username: "{{ host_cluster.username }}"
+        url_password: "{{ host_cluster.password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          connected: true
+        status_code: 200
+      loop: "{{ source_node_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    - name: "Wait for remote cluster connection to be re-established"
+      scale_computing.hypercore.remote_cluster_info:
+      register: reconnect_status
+      until: >-
+        (reconnect_status.records
+         | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+         | list | length) > 0
+      retries: 24
+      delay: 5
+
+    - name: "Connectivity restored"
+      ansible.builtin.debug:
+        msg: "Source cluster connection re-established. Safe to re-run test_failover_live.yml."
