@@ -226,6 +226,12 @@
     source_cluster_vm_name: ""  # defaults to hypercore_cluster_name from source inventory
 
   tasks:
+    - name: "Initialize test result tracking"
+      ansible.builtin.set_fact:
+        result_guard_check: "NOT RUN"
+        result_failover: "NOT RUN"
+        result_idempotency: "NOT RUN"
+
     - name: "Wait for replicated VMs to appear on DR target"
       scale_computing.hypercore.vm_info:
       register: dr_vm_info_poll
@@ -345,6 +351,18 @@
               cluster was online and replication connection was ESTABLISHED.
               ============================================
 
+        - name: "Record guard check result"
+          ansible.builtin.set_fact:
+            result_guard_check: "PASS"
+
+      rescue:
+        - name: "Record guard check failure"
+          ansible.builtin.set_fact:
+            result_guard_check: "FAIL"
+        - name: "Re-raise guard check failure"
+          ansible.builtin.fail:
+            msg: "Guard check failed — see output above."
+
     - name: "Simulate outage, run failover, and restore connectivity"
       block:
         - name: "Disconnect NIC on source cluster node VM to simulate outage"
@@ -451,6 +469,10 @@
                 msg: "TEST PASSED. Reconnecting source cluster NICs and proceeding to cleanup."
               when: auto_disconnect | bool
 
+            - name: "Record failover result"
+              ansible.builtin.set_fact:
+                result_failover: "PASS"
+
         - name: "Idempotency check — re-run failover playbook with DR VMs already present"
           block:
             - name: "Re-run automated DR failover playbook (should be a no-op)"
@@ -505,7 +527,14 @@
                   clones and correctly reported: 'Failover has already run.'
                   ============================================
 
+            - name: "Record idempotency result"
+              ansible.builtin.set_fact:
+                result_idempotency: "PASS"
+
           rescue:
+            - name: "Record idempotency failure"
+              ansible.builtin.set_fact:
+                result_idempotency: "FAIL"
             - name: "Idempotency test failed — re-raise"
               ansible.builtin.fail:
                 msg: "IDEMPOTENCY TEST FAILED. See output above."
@@ -523,6 +552,10 @@
           ansible.builtin.debug:
             msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
           when: auto_disconnect | bool
+
+        - name: "Record failover failure"
+          ansible.builtin.set_fact:
+            result_failover: "FAIL"
 
       always:
         - name: "Reconnect NIC on source cluster node VM"
@@ -610,4 +643,31 @@
         state: absent
       loop: "{{ all_dr_vms.records | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$') | rejectattr('vm_name', 'match', '.*-DR$') | list }}"
       when: all_dr_vms.records is defined
+
+- name: "DR failover live integration test - final summary"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: "Print final test summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          DR FAILOVER LIVE TEST — FINAL SUMMARY
+          ============================================================
+          Guard check (no-op while source online): {{ result_guard_check | default('NOT RUN') }}
+          Failover (clone + power on):             {{ result_failover    | default('NOT RUN') }}
+          Idempotency (re-run must be no-op):      {{ result_idempotency | default('NOT RUN') }}
+          ------------------------------------------------------------
+          Overall: {{ 'PASS' if (result_guard_check | default('') == 'PASS' and result_failover | default('') == 'PASS' and result_idempotency | default('') == 'PASS') else 'FAIL' }}
+          ============================================================
+
+    - name: "Fail play if any test phase failed"
+      ansible.builtin.fail:
+        msg: "One or more test phases failed. See summary above."
+      when: >-
+        result_guard_check | default('') != 'PASS' or
+        result_failover    | default('') != 'PASS' or
+        result_idempotency | default('') != 'PASS'
 
