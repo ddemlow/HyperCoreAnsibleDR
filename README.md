@@ -34,6 +34,11 @@ The playbook runs entirely against the **DR (target) cluster** and proceeds thro
 5. **Idempotency check** — if VMs tagged with `dr_vm_tag` already exist, exit (failover already ran)
 6. **Failover** — clones all VMs that have a `replication_source_vm_uuid` (i.e., are replication targets), preserving MAC addresses, then powers them on
 
+> **MAC address preservation** (`preserve_mac_address: true`) is intentional and important. Keeping the original MAC addresses means:
+> - DHCP servers issue the same IPs the VMs had on the primary cluster — no DNS/firewall/load-balancer changes required
+> - Application software tied to a MAC address (some licensing, some network agents) continues to work without reactivation
+> - This applies to both initial failover and failback cutover (cloning back to source)
+
 ## Requirements
 
 - Scale Computing HyperCore cluster running ICOS v9.4 or later

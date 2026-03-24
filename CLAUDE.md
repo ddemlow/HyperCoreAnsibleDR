@@ -88,7 +88,7 @@ is appropriate only for:
 
 ```yaml
 scale_computing.hypercore.vm_info            # list VMs
-scale_computing.hypercore.vm_clone           # clone with preserve_mac_address: true
+scale_computing.hypercore.vm_clone           # clone with preserve_mac_address: true (always — see below)
 scale_computing.hypercore.vm_params          # power state changes
 scale_computing.hypercore.vm_replication     # configure/disable replication
 scale_computing.hypercore.remote_cluster_info  # verify ESTABLISHED, resolve cluster name
@@ -154,6 +154,13 @@ ansible.builtin.uri:
 ### `vm_replication` requires cluster name, not IP
 
 Resolve at runtime via `remote_cluster_info`. Never hardcode.
+
+### MAC address preservation
+
+Always clone with `preserve_mac_address: true`. This is not optional:
+- DHCP servers re-issue the same IPs → no DNS/firewall/LB changes needed after failover
+- Software licensed or fingerprinted by MAC address (network agents, some commercial apps) continues working without reactivation
+- Applies to **both** failover clones and failback cutover clones
 
 ### Idempotency
 
