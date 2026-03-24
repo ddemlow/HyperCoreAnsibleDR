@@ -71,20 +71,25 @@ but do not roll back — report and let the operator decide. Pairs naturally wit
 
 ---
 
-## 4. Replication lag / RPO check before failover (MEDIUM impact / LOW effort)
+## 4. Replication lag / RPO check before failover (HIGH impact / LOW effort)
 
-**Why fourth:** Before committing to failover, the operator should know how stale the replicated
-snapshots are. If replication has been broken for 6 hours, the data loss window is 6 hours.
+**Why this matters:** The playbook only checks that *a* snapshot exists — it does not check
+when it was taken or whether replication was healthy leading up to the outage. If replication
+had been silently broken for hours or days before the failure, the cloned VMs will be
+significantly out of date. The operator has no visibility into this unless they check manually
+before running failover.
 
-Use `vm_replication_info` to check replication state and last-sync time for each VM before
-cloning. Emit a clear warning (and optionally abort if `max_rpo_hours` is exceeded):
+Use `vm_replication_info` to surface replication state and last-sync time for each VM before
+cloning. At minimum, emit a clear warning showing snapshot age. Optionally abort if
+`max_rpo_hours` is exceeded:
 
 ```yaml
-max_rpo_hours: 1   # abort failover if any VM's last snapshot is older than this; 0 = no limit
+max_rpo_hours: 1   # abort failover if any VM's last snapshot is older than this; 0 = warn only
 ```
 
-Also useful as a standalone monitoring playbook run on a schedule to detect replication issues
-before a real disaster occurs.
+This is also useful as a standalone monitoring playbook run on a regular schedule to detect
+replication issues before a real disaster occurs — turning a silent failure mode into an
+alert.
 
 ---
 

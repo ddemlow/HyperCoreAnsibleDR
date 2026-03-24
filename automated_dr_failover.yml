@@ -56,6 +56,10 @@
 #   - VM-to-source-cluster mapping: the HyperCore API on the target does not expose
 #     which source cluster each replicated VM came from, making per-cluster VM selection
 #     impossible without tagging VMs on the source before replication.
+#   - Snapshot age not checked: the playbook verifies a snapshot exists but does NOT
+#     check when it was taken. If replication was broken or delayed before the outage,
+#     the snapshot may be hours or days old. Manually verify replication health and
+#     snapshot recency before running failover to understand the actual data loss window.
 #   - Graceful failover: shut down source VMs, wait for final snapshot to replicate,
 #     then clone — ensures zero data loss vs. cloning from last periodic snapshot.
 #   - Failback workflow: return DR VMs to primary once it is restored.

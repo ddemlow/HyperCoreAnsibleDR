@@ -207,10 +207,18 @@ idempotency check will pass cleanly.
   from. All replicated VMs are failed over when any source cluster is confirmed down. Tag
   source VMs on the primary with their cluster name before replication to work around this.
 
-- **Graceful failover** — The playbook clones from the most recent replication snapshot.
-  Any writes to the source VMs since the last snapshot will be lost. A graceful failover
-  (shut down source, wait for final snapshot to replicate, then clone) is not currently
-  automated.
+- **Snapshot age is not checked** — The playbook only verifies that at least one replication
+  snapshot exists before cloning. It does not check when that snapshot was taken or whether
+  replication was healthy leading up to the outage. If replication had been broken or delayed
+  for hours or days before the failure, the cloned VMs may be significantly out of date —
+  potentially much older than the "time since last snapshot" framing implies. **Before
+  triggering failover, manually verify replication health and snapshot recency in the
+  HyperCore UI** to understand your actual data loss window.
+
+- **Graceful failover** — Because the playbook clones from whatever snapshot exists at the
+  time of failover, any writes since that snapshot are lost. A graceful failover — shut down
+  source VMs, wait for a final snapshot to complete replication, then clone — is not
+  currently automated and requires the primary to still be partially accessible.
 
 - **Failback** — Returning failed-over VMs to the primary site after it is restored is not
   automated. Manual steps are required.
