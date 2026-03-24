@@ -189,21 +189,18 @@
           {{ host_cluster.host }}. Check host_cluster credentials and source_cluster_vm_name.
       when: auto_disconnect | bool and (source_node_vms | default([]) | length == 0)
 
-    - name: "Disconnect NICs on source cluster node VMs to simulate outage"
+    - name: "Disconnect NIC on source cluster node VM to simulate outage"
       scale_computing.hypercore.vm_nic:
         cluster_instance:
           host: "{{ host_cluster.host }}"
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
-        vm_name: "{{ item.0.vm_name }}"
-        state: set  # set: replace NIC list — required to change connected flag
+        vm_name: "{{ source_node_vms[0].vm_name }}"
+        state: set
         items:
-          - vlan: "{{ item.1.vlan }}"
-            type: "{{ item.1.type }}"
+          - vlan: "{{ source_node_vms[0].nics[0].vlan }}"
+            type: "{{ source_node_vms[0].nics[0].type }}"
             connected: false
-      loop: "{{ source_node_vms | subelements('nics') }}"
-      loop_control:
-        label: "{{ item.0.vm_name }} vlan {{ item.1.vlan }}"
       when: auto_disconnect | bool
 
     - name: "Instruct operator to poweroff/disconnect source cluster before failover"
@@ -316,15 +313,12 @@
           host: "{{ host_cluster.host }}"
           username: "{{ host_cluster.username }}"
           password: "{{ host_cluster.password }}"
-        vm_name: "{{ item.0.vm_name }}"
-        state: set  # set: replace NIC list — required to change connected flag
+        vm_name: "{{ source_node_vms[0].vm_name }}"
+        state: set
         items:
-          - vlan: "{{ item.1.vlan }}"
-            type: "{{ item.1.type }}"
+          - vlan: "{{ source_node_vms[0].nics[0].vlan }}"
+            type: "{{ source_node_vms[0].nics[0].type }}"
             connected: true
-      loop: "{{ source_node_vms | subelements('nics') }}"
-      loop_control:
-        label: "{{ item.0.vm_name }} vlan {{ item.1.vlan }}"
       when: auto_disconnect | bool and source_node_vms is defined
 
     - name: "Wait for remote cluster connection to be re-established"
