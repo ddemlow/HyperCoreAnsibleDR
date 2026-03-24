@@ -1,15 +1,22 @@
 ---
 # automated_dr_failover.yml
 #
-# Automated DR Failover for Scale Computing HyperCore
+# DR Failover Runbook for Scale Computing HyperCore
 #
-# Runs against the DR (target) cluster. Checks whether primary (source)
-# cluster(s) are unreachable, verifies the DR cluster is healthy, then
-# clones all replicated VMs and powers them on.
+# Two operating modes:
 #
-# Designed to be run on a schedule (e.g., every 5 minutes via cron/AWX).
+#   EMERGENCY (default): source cluster is unreachable. Verifies disconnection via
+#   replication link status + node ping, then clones all replicated VMs on DR.
+#   RPO = age of last replication snapshot (minutes to hours depending on schedule).
 #
-# Phases:
+#   PLANNED (-e "planned_failover=true"): operator-initiated ahead of a known event
+#   (hurricane, data center maintenance, migration). Source cluster is still online.
+#   Gracefully shuts down source VMs first, waits for the shutdown snapshot to fully
+#   replicate, then clones — guaranteeing zero data loss (RPO = 0).
+#   Requires the inventory to include a 'source' group (same two-group structure used
+#   by the failback playbooks).
+#
+# Phases (emergency mode):
 #   1. Check replication links — if all monitored clusters are ESTABLISHED, exit
 #   2. Ping all nodes of disconnected clusters — if any respond, exit (split-brain risk)
 #   3. Verify DR cluster nodes are reachable before proceeding
@@ -17,32 +24,50 @@
 #   5. Clone all replicated VMs (excluding dr_exclude_tag), preserving MAC addresses
 #   6. Power on cloned VMs
 #
+# Phases (planned mode):
+#   1-2. SKIPPED (source is intentionally still reachable)
+#   3. Verify DR cluster nodes are reachable
+#   4. Idempotency — skip if failover VMs already exist; VM discovery
+#   4.5. Operator YES confirmation; gracefully shut down source VMs; wait for
+#        shutdown snapshot to appear and reach 100% replication on DR
+#   5. Clone all replicated VMs, preserving MAC addresses
+#   6. Power on cloned VMs
+#
+# MAC address preservation: preserve_mac_address: true is always set. This ensures
+# DHCP servers re-issue the same IPs (no DNS/firewall changes needed) and that
+# software tied to a MAC address continues working without reactivation.
+#
 # Required variables (set in inventory or extra-vars):
 #   scale_user   — HyperCore username (default: admin)
 #   scale_pass   — HyperCore password (default: admin)
 #
 # Optional variables (override defaults below):
-#   source_cluster_name  — Monitor only this named remote cluster.
-#                          Leave empty ("") to monitor ALL remote clusters.
-#                          NOTE: With multiple source clusters, all replicated VMs are
-#                          failed over regardless of which source cluster they came from,
-#                          because the HyperCore API on the target does not expose which
-#                          source cluster a replicated VM originated from.
-#   ping_retries         — Times to retry a ping before declaring a node down (default: 3)
-#   ping_delay           — Seconds between ping retries (default: 5)
-#   dr_vm_tag            — Tag applied to cloned failover VMs (default: DR-failover)
-#   dr_exclude_tag       — VMs with this tag are skipped during failover (default: "")
-#                          Useful for infrastructure VMs (DNS, NTP, monitoring) that
-#                          should not be auto-cloned.
-#   http_check_host      — Optional host TCP-checked as an application-alive signal.
-#                          If this host responds, failover is aborted regardless of
-#                          cluster connection status. (default: "")
-#   http_check_port      — TCP port for the application-alive check (default: 80)
+#   planned_failover        — Set true for operator-initiated zero-RPO failover (default: false)
+#   skip_operator_confirmation — Set true to skip the YES pause (TEST USE ONLY, default: false)
+#   source_cluster_name     — Monitor only this named remote cluster (emergency only).
+#                             Leave empty ("") to monitor ALL remote clusters.
+#   ping_retries            — Times to retry a ping before declaring a node down (default: 3)
+#   ping_delay              — Seconds between ping retries (default: 5)
+#   dr_vm_tag               — Tag applied to cloned failover VMs (default: DR-failover)
+#   dr_exclude_tag          — VMs with this tag are skipped during failover (default: "")
+#                             Useful for infrastructure VMs (DNS, NTP, monitoring).
+#   http_check_host         — Optional host TCP-checked as application-alive signal (emergency only).
+#                             If this host responds, failover is aborted. (default: "")
+#   http_check_port         — TCP port for the application-alive check (default: 80)
+#   source_shutdown_retries — Retries waiting for each source VM to SHUTOFF (planned, default: 30)
+#   source_shutdown_delay   — Seconds between shutdown polls (planned, default: 10)
+#   force_stop_source_after_graceful — Force stop source VMs that don't shut down (planned, default: true)
+#   planned_snapshot_wait_retries — Retries waiting for shutdown snapshot on DR (planned, default: 60)
+#   planned_snapshot_wait_delay   — Seconds between snapshot polls (planned, default: 10)
+#   planned_replication_retries   — Retries waiting for 100% replication (planned, default: 120)
+#   planned_replication_delay     — Seconds between replication polls (planned, default: 10)
 #
 # Usage:
+#   # Emergency failover (normal operation / cron):
 #   ansible-playbook automated_dr_failover.yml -i inventory/
-#   ansible-playbook automated_dr_failover.yml -i inventory/ \
-#     -e "source_cluster_name=primary-site dr_exclude_tag=dr-exclude"
+#
+#   # Planned failover (operator-initiated, zero RPO):
+#   ansible-playbook automated_dr_failover.yml -i inventory/ -e "planned_failover=true"
 #
 # Known limitations / possible enhancements:
 #   - Connection timeout detection: After source cluster is powered off/disconnected,
@@ -52,17 +77,14 @@
 #     proceed until the DR cluster has recognized the disconnection.
 #   - Startup ordering: VMs are powered on in arbitrary order. A possible enhancement
 #     could respect a user-defined startup sequence (e.g., DB before app before web).
-#     See: https://github.com/ScaleComputing/HyperCoreAnsibleCollection/issues (log there)
 #   - VM-to-source-cluster mapping: the HyperCore API on the target does not expose
 #     which source cluster each replicated VM came from, making per-cluster VM selection
 #     impossible without tagging VMs on the source before replication.
-#   - Snapshot age not checked: the playbook verifies a snapshot exists but does NOT
-#     check when it was taken. If replication was broken or delayed before the outage,
-#     the snapshot may be hours or days old. Manually verify replication health and
-#     snapshot recency before running failover to understand the actual data loss window.
-#   - Graceful failover: shut down source VMs, wait for final snapshot to replicate,
-#     then clone — ensures zero data loss vs. cloning from last periodic snapshot.
-#   - Failback workflow: return DR VMs to primary once it is restored.
+#   - Snapshot age not checked (emergency mode): the playbook verifies a snapshot exists
+#     but does NOT check when it was taken. Manually verify replication health and
+#     snapshot recency before running emergency failover.
+#   - Failback workflow: use automated_dr_failback_prepare/cutover/cleanup.yml after
+#     the primary cluster is restored. Works identically after emergency or planned failover.
 #   - Post-failover health checks: TCP port test per VM to confirm app is ready.
 
 - name: Automated DR Failover - HyperCore
@@ -77,35 +99,55 @@
     SC_PASSWORD: "{{ scale_pass | default('admin') }}"
 
   vars:
-    source_cluster_name: ""    # empty = monitor all remote clusters
-    ping_retries: 3             # retry attempts per node IP
-    ping_delay: 5               # seconds between retries
-    dr_vm_tag: "DR-failover"   # tag applied to all cloned VMs
-    dr_exclude_tag: ""          # VMs with this tag are skipped (e.g., "dr-exclude")
-    http_check_host: ""         # optional application-alive check host
+    # ── Mode ──────────────────────────────────────────────────────────────────
+    planned_failover: false          # true = operator-initiated zero-RPO failover
+    skip_operator_confirmation: false  # true = skip YES pause (TEST USE ONLY, never in production)
+
+    # ── Emergency mode ────────────────────────────────────────────────────────
+    source_cluster_name: ""          # empty = monitor all remote clusters
+    ping_retries: 3                  # retry attempts per node IP
+    ping_delay: 5                    # seconds between retries
+    http_check_host: ""              # optional application-alive check host
     http_check_port: 80
-    disconnect_detect_retries: 24  # retries waiting for DR to detect source disconnection
-    disconnect_detect_delay: 5     # seconds between disconnect-detection polls
-    snapshot_wait_retries: 120     # retries waiting for at least one replication snapshot per VM
-    snapshot_wait_delay: 5         # seconds between snapshot polls
+    disconnect_detect_retries: 24    # retries waiting for DR to detect source disconnection
+    disconnect_detect_delay: 5       # seconds between disconnect-detection polls
+
+    # ── Common ────────────────────────────────────────────────────────────────
+    dr_vm_tag: "DR-failover"         # tag applied to all cloned VMs
+    dr_exclude_tag: ""               # VMs with this tag are skipped (e.g., "dr-exclude")
+    snapshot_wait_retries: 120       # retries waiting for at least one replication snapshot per VM
+    snapshot_wait_delay: 5           # seconds between snapshot polls
+
+    # ── Planned mode ──────────────────────────────────────────────────────────
+    source_shutdown_retries: 30      # retries waiting for each source VM to SHUTOFF
+    source_shutdown_delay: 10        # seconds between shutdown polls (5 min total)
+    force_stop_source_after_graceful: true  # force stop source VMs that don't shut down
+    planned_snapshot_wait_retries: 60  # retries waiting for shutdown snapshot on DR (10 min)
+    planned_snapshot_wait_delay: 10
+    planned_replication_retries: 120   # retries waiting for 100% replication (20 min)
+    planned_replication_delay: 10
 
   tasks:
 
     # =========================================================
     # PHASE 1: Check replication connection status
     # Exit if all monitored clusters are still ESTABLISHED.
+    # SKIPPED in planned_failover mode (source is intentionally online).
     # =========================================================
 
     - name: "[1/6] Get remote cluster connections"
       scale_computing.hypercore.remote_cluster_info:
       register: remote_clusters
+      when: not (planned_failover | bool)
 
     - name: "[1/6] Fail if no remote clusters are configured"
       ansible.builtin.fail:
         msg: >
           No remote cluster connections found on {{ inventory_hostname }}.
           Configure replication before using this playbook.
-      when: remote_clusters.records | length == 0
+      when:
+        - not (planned_failover | bool)
+        - remote_clusters.records | length == 0
 
     - name: "[1/6] Identify clusters to monitor"
       ansible.builtin.set_fact:
@@ -117,6 +159,7 @@
             if source_cluster_name != ''
             else remote_clusters.records
           }}
+      when: not (planned_failover | bool)
 
     - name: "[1/6] Fail if source_cluster_name not found"
       ansible.builtin.fail:
@@ -125,6 +168,7 @@
           Available clusters: {{ remote_clusters.records | map(attribute='name') | list }}.
           Check the name or leave source_cluster_name empty to monitor all clusters.
       when:
+        - not (planned_failover | bool)
         - source_cluster_name != ''
         - clusters_to_check | length == 0
 
@@ -134,10 +178,13 @@
           {{ clusters_to_check
              | rejectattr('connection_status', 'equalto', 'ESTABLISHED')
              | list }}
+      when: not (planned_failover | bool)
 
     - name: "[1/6] Exit — all monitored clusters are ESTABLISHED (no failover needed)"
       ansible.builtin.meta: end_host
-      when: disconnected_clusters | length == 0
+      when:
+        - not (planned_failover | bool)
+        - disconnected_clusters | length == 0
 
     - name: "[1/6] Disconnected cluster(s) detected — continuing checks"
       ansible.builtin.debug:
@@ -148,11 +195,13 @@
                disconnected_clusters | map(attribute='connection_status'))
              | map('join', ' → ') | list }}.
           Verifying primary nodes are truly unreachable before proceeding.
+      when: not (planned_failover | bool)
 
     # =========================================================
     # PHASE 2: Ping all nodes of all disconnected clusters
     # If any node from any disconnected cluster responds, abort —
     # split-brain or partial failure is possible, too risky to proceed.
+    # SKIPPED in planned_failover mode (source is intentionally reachable).
     # =========================================================
 
     - name: "[2/6] Collect node IPs from all disconnected clusters"
@@ -161,6 +210,7 @@
           {{ disconnected_clusters
              | map(attribute='remote_node_ips')
              | flatten | unique | list }}
+      when: not (planned_failover | bool)
 
     - name: "[2/6] Fail if no node IPs available for disconnected clusters"
       ansible.builtin.fail:
@@ -168,12 +218,14 @@
           No remote_node_ips found for disconnected cluster(s):
           {{ disconnected_clusters | map(attribute='name') | list }}.
           Cannot verify primary status via ping. Check cluster configuration.
-      when: primary_node_ips | length == 0
+      when:
+        - not (planned_failover | bool)
+        - primary_node_ips | length == 0
 
     - name: "[2/6] Ping all disconnected cluster nodes ({{ ping_retries }} retries, {{ ping_delay }}s delay)"
       ansible.builtin.command: ping -c 1 {{ item }}
       register: primary_ping
-      loop: "{{ primary_node_ips }}"
+      loop: "{{ primary_node_ips | default([]) }}"
       loop_control:
         label: "{{ item }}"
       ignore_errors: true
@@ -181,10 +233,13 @@
       retries: "{{ ping_retries }}"
       delay: "{{ ping_delay }}"
       until: primary_ping.rc == 0  # retry while unreachable; stop as soon as node responds
+      when: not (planned_failover | bool)
 
     - name: "[2/6] Exit — a primary node responded (split-brain risk, no failover)"
       ansible.builtin.meta: end_host
-      when: primary_ping.results | selectattr('rc', 'equalto', 0) | list | length > 0
+      when:
+        - not (planned_failover | bool)
+        - primary_ping.results | selectattr('rc', 'equalto', 0) | list | length > 0
 
     # Optional: abort if a known application endpoint is still alive
     - name: "[2/6] Application-alive TCP check {{ http_check_host }}:{{ http_check_port }}"
@@ -194,11 +249,14 @@
         timeout: 10
       register: http_check_result
       ignore_errors: true
-      when: http_check_host != ""
+      when:
+        - not (planned_failover | bool)
+        - http_check_host != ""
 
     - name: "[2/6] Exit — application at {{ http_check_host }} is still responding (no failover needed)"
       ansible.builtin.meta: end_host
       when:
+        - not (planned_failover | bool)
         - http_check_host != ""
         - not (http_check_result is skipped)
         - http_check_result is not failed
@@ -209,6 +267,7 @@
           All {{ primary_ping.results | length }} node IP(s) across
           {{ disconnected_clusters | length }} cluster(s) are unreachable
           after {{ ping_retries }} retries. Waiting for DR cluster to confirm disconnection.
+      when: not (planned_failover | bool)
 
     - name: "[2/6] Wait for DR cluster to detect source disconnection (up to {{ disconnect_detect_retries * disconnect_detect_delay }}s)"
       scale_computing.hypercore.remote_cluster_info:
@@ -219,6 +278,7 @@
          | list | length) > 0
       retries: "{{ disconnect_detect_retries }}"
       delay: "{{ disconnect_detect_delay }}"
+      when: not (planned_failover | bool)
 
     - name: "[2/6] DR cluster confirmed disconnection from source"
       ansible.builtin.debug:
@@ -227,6 +287,7 @@
             | rejectattr('connection_status', 'equalto', 'ESTABLISHED')
             | map(attribute='name') | list }} as disconnected.
           Proceeding to DR cluster health check.
+      when: not (planned_failover | bool)
 
     # =========================================================
     # PHASE 3: Verify DR cluster is healthy enough to proceed
@@ -347,6 +408,206 @@
       delay: "{{ snapshot_wait_delay }}"
 
     # =========================================================
+    # PHASE 4.5 (planned_failover=true only):
+    # Gracefully shut down source VMs, wait for the shutdown snapshot
+    # to appear on the DR replication targets, wait for 100% replication.
+    # This guarantees zero RPO before cloning in Phase 5.
+    # =========================================================
+
+    - name: "[4.5/6] Planned failover — validate source inventory group is defined"
+      ansible.builtin.fail:
+        msg: >-
+          planned_failover=true requires a 'source' inventory group so the playbook
+          can reach the source cluster to shut down VMs. Add a [source] group to your
+          inventory (same structure used by the failback playbooks) and re-run.
+      when:
+        - planned_failover | bool
+        - groups['source'] is not defined or groups['source'] | length == 0
+
+    - name: "[4.5/6] Planned failover — verify source cluster is ESTABLISHED from DR"
+      scale_computing.hypercore.remote_cluster_info:
+      register: planned_remote_clusters
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — fail if source is not ESTABLISHED"
+      ansible.builtin.fail:
+        msg: >-
+          planned_failover=true requires the source cluster to be ESTABLISHED.
+          Current remote cluster statuses: {{ planned_remote_clusters.records
+            | map(attribute='connection_status') | list }}
+          If the source is already unreachable, omit planned_failover=true to use
+          emergency failover mode instead.
+      when:
+        - planned_failover | bool
+        - (planned_remote_clusters.records
+           | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+           | list | length) == 0
+
+    - name: "[4.5/6] Planned failover — display pre-flight summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          PLANNED FAILOVER — PRE-FLIGHT
+          ============================================================
+          DR cluster      : {{ inventory_hostname }}
+          Source cluster  : {{ groups['source'][0] }}
+          VMs to fail over: {{ vms_to_failover | length }}
+          {% for vm in vms_to_failover %}
+          - {{ vm.vm_name }}
+          {% endfor %}
+
+          This will:
+            1. Gracefully shut down the above VMs on the SOURCE cluster
+               (service outage begins here — schedule a maintenance window)
+            2. Wait for the shutdown snapshot to replicate to DR (zero RPO)
+            3. Clone and power on the VMs on DR
+
+          The failback playbooks return workloads to source when ready.
+          ============================================================
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — operator YES confirmation"
+      ansible.builtin.pause:
+        prompt: "Type YES (uppercase) to shut down source VMs and proceed with planned failover."
+      register: planned_confirmation
+      when:
+        - planned_failover | bool
+        - not (skip_operator_confirmation | bool)
+
+    - name: "[4.5/6] Planned failover — abort if operator did not confirm"
+      ansible.builtin.fail:
+        msg: "Planned failover aborted — operator did not confirm with YES."
+      when:
+        - planned_failover | bool
+        - not (skip_operator_confirmation | bool)
+        - planned_confirmation.user_input | upper != "YES"
+
+    - name: "[4.5/6] Planned failover — record pre-shutdown snapshot counts on DR replication targets"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: planned_pre_snapshots_raw
+      loop: "{{ vms_to_failover }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — build pre-shutdown snapshot count map"
+      ansible.builtin.set_fact:
+        planned_pre_snapshot_counts: >-
+          {{ planned_pre_snapshot_counts | default({})
+             | combine({item.item.vm_name: item.records | length}) }}
+      loop: "{{ planned_pre_snapshots_raw.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name | default('unknown') }}"
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — get source VMs to identify shutdown candidates"
+      scale_computing.hypercore.vm_info:
+        cluster_instance:
+          host: "https://{{ groups['source'][0] }}"
+          username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+          password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+      register: source_cluster_vms
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — build source shutdown list (match by name to vms_to_failover)"
+      ansible.builtin.set_fact:
+        vms_to_failover_on_source: >-
+          {{ source_cluster_vms.records
+             | selectattr('vm_name', 'in', vms_to_failover | map(attribute='vm_name') | list)
+             | list }}
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — gracefully shut down source VMs (skip already SHUTOFF)"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.vm_name }}"
+        power_state: shutdown
+        cluster_instance:
+          host: "https://{{ groups['source'][0] }}"
+          username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+          password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+      loop: "{{ vms_to_failover_on_source | default([]) | rejectattr('power_state', 'equalto', 'SHUTOFF') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — wait for each source VM to reach SHUTOFF"
+      scale_computing.hypercore.vm_info:
+        vm_name: "{{ item.vm_name }}"
+        cluster_instance:
+          host: "https://{{ groups['source'][0] }}"
+          username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+          password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+      register: planned_shutdown_results
+      until: planned_shutdown_results.records[0].power_state == 'SHUTOFF'
+      retries: "{{ source_shutdown_retries }}"
+      delay: "{{ source_shutdown_delay }}"
+      loop: "{{ vms_to_failover_on_source | default([]) }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      ignore_errors: true
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — force stop source VMs that did not shut down gracefully"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.item.vm_name }}"
+        power_state: stop
+        cluster_instance:
+          host: "https://{{ groups['source'][0] }}"
+          username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+          password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+      loop: "{{ planned_shutdown_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name | default('unknown') }}"
+      when:
+        - planned_failover | bool
+        - force_stop_source_after_graceful | bool
+        - item.failed is defined and item.failed
+      ignore_errors: true
+
+    - name: "[4.5/6] Planned failover — wait for shutdown snapshot to appear on DR targets (count delta)"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: planned_post_snapshots
+      until: >-
+        (planned_post_snapshots.records | length) >
+        (planned_pre_snapshot_counts[item.vm_name] | int)
+      retries: "{{ planned_snapshot_wait_retries }}"
+      delay: "{{ planned_snapshot_wait_delay }}"
+      loop: "{{ vms_to_failover }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — wait for shutdown snapshot to reach 100% replication on DR"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: planned_replication_poll
+      until: >-
+        (planned_replication_poll.json
+         | selectattr('virDomainUUID', 'in', vms_to_failover | map(attribute='uuid') | list)
+         | list | length) == (vms_to_failover | length)
+        and
+        (planned_replication_poll.json
+         | selectattr('virDomainUUID', 'in', vms_to_failover | map(attribute='uuid') | list)
+         | map(attribute='progress.percentComplete')
+         | list | min | default(0)) == 100
+      retries: "{{ planned_replication_retries }}"
+      delay: "{{ planned_replication_delay }}"
+      when: planned_failover | bool
+
+    - name: "[4.5/6] Planned failover — shutdown snapshot at 100%, proceeding to clone"
+      ansible.builtin.debug:
+        msg: >-
+          Shutdown snapshot fully replicated for all {{ vms_to_failover | length }} VMs.
+          Zero RPO achieved — cloning now.
+      when: planned_failover | bool
+
+    # =========================================================
     # PHASE 5 + 6: Clone then power on
     # block/rescue reports partial failures cleanly rather than
     # aborting mid-way and leaving an inconsistent state.
@@ -404,7 +665,8 @@
           ============================================
           DR FAILOVER COMPLETE — {{ inventory_hostname }}
           ============================================
-          Triggered by  : {{ disconnected_clusters | map(attribute='name') | list | join(', ') }}
+          Mode          : {{ 'PLANNED (zero RPO — source VMs shut down cleanly)' if (planned_failover | bool) else 'EMERGENCY (cloned from last replication snapshot)' }}
+          Triggered by  : {{ 'operator (planned_failover=true)' if (planned_failover | bool) else disconnected_clusters | default([]) | map(attribute='name') | list | join(', ') }}
           VMs excluded  : {{ excluded_vm_names | join(', ') | default('none', true) }}
           VMs cloned    : {{ cloned_vms.results | selectattr('changed') | list | length }} / {{ vms_to_failover | length }}
           VMs powered on: {{ powered_vms.results | default([]) | selectattr('changed') | list | length }}
@@ -417,4 +679,5 @@
             - Verify applications are responding on cloned VMs
             - Update DNS / load balancer records if needed
             - Notify on-call team
+            - When ready to return to source: run automated_dr_failback_prepare.yml
           ============================================

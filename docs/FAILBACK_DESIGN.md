@@ -52,32 +52,30 @@ In both cases, after the DR site has been running for some time, the DR VMs will
 have accumulated new writes. Failback must replicate those writes back to source
 before cutting over — the same `prepare → cutover → cleanup` sequence applies.
 
-### Planned failover flow (future enhancement to `automated_dr_failover.yml`)
+### Planned failover mode (implemented in `automated_dr_failover.yml`)
 
-A planned failover needs a `planned_failover=true` mode that:
+Planned failover is triggered with `-e "planned_failover=true"`. It:
 
-1. **Skips** the disconnect/ping guard checks (source is intentionally still online)
-2. **Gracefully shuts down source VMs** (same pattern as cutover Play 2: graceful → force stop)
-3. **Waits for the shutdown snapshot to appear and reach 100% replication** (same URI
-   poll as cutover Play 2 steps 4–5)
-4. **Then clones** — same as the standard failover clone + power-on
+1. **Skips** Phases 1–2 (disconnect check + ping guard) — source is intentionally online
+2. **Requires** a `source` inventory group (same two-group structure as failback)
+3. **Operator confirms** with "YES" before source VMs are touched
+4. **Phase 4.5**: gracefully shuts down source VMs via `cluster_instance:`, with
+   force-stop fallback; waits for shutdown snapshot on DR targets (count delta);
+   waits for 100% replication via URI poll
+5. **Phases 5–6**: clone + power on — identical to emergency mode
 
-This gives zero-RPO failover for planned events (hurricanes, maintenance, migrations)
-using the same DR infrastructure already in place.
+Result: RPO = 0. The same DR VM naming convention, tags, and idempotency logic apply.
+Failback is identical after either emergency or planned failover.
 
-Implementation sketch for `automated_dr_failover.yml`:
+Key variables (all in `automated_dr_failover.yml` vars block):
 ```yaml
-vars:
-  planned_failover: false   # set true via -e for operator-initiated graceful failover
-
-# When planned_failover: true:
-#   - Skip Phase 1 (cluster disconnect check) and Phase 2 (ping guard)
-#   - Add new Phase 1.5: shut down source VMs, wait for shutdown snapshot at 100%
-#   - Phase 3+ (clone, power on) proceeds identically
+planned_failover: false             # set true via -e
+skip_operator_confirmation: false   # TEST USE ONLY — never in production
+source_shutdown_retries: 30         # × source_shutdown_delay = 5 min default
+force_stop_source_after_graceful: true
+planned_snapshot_wait_retries: 60   # × 10s = 10 min
+planned_replication_retries: 120    # × 10s = 20 min
 ```
-
-The same DR VM naming convention, tags, and idempotency logic apply regardless of mode.
-Failback is identical in both cases.
 
 ---
 

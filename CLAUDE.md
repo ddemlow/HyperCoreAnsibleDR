@@ -176,15 +176,29 @@ autonomous operation (which requires additional split-brain fencing and alerting
 
 ### Two failover modes (both use the same playbook)
 
-**Emergency failover** — source is unreachable, failover triggered by operator or cron:
-- Playbook verifies source is DISCONNECTED (exits if ESTABLISHED)
+**Emergency failover** (default) — source is unreachable:
+```bash
+ansible-playbook automated_dr_failover.yml -i inventory/
+```
+- Verifies source is DISCONNECTED (exits if ESTABLISHED — no action needed)
 - Pings source nodes (exits if any respond — split-brain guard)
-- Clones replication targets and powers on
+- Clones replication targets from last periodic snapshot and powers on
+- RPO = age of last snapshot (minutes to hours)
 
-**Planned failover** — operator-initiated ahead of a planned outage (e.g. storm, maintenance):
-- Same clone + power-on logic but the operator pre-shuts down source VMs first
-- Final shutdown snapshot replicates → clone from zero-RPO state
-- Future: `planned_failover=true` flag to skip disconnect/ping checks
+**Planned failover** — operator-initiated ahead of a known event (hurricane, maintenance):
+```bash
+ansible-playbook automated_dr_failover.yml -i inventory/ -e "planned_failover=true"
+```
+- Skips disconnect/ping guards (source is intentionally still online)
+- Requires `source` group in inventory (same two-group structure as failback playbooks)
+- Operator confirms with "YES" before source VMs are touched
+- Gracefully shuts down source VMs (with force-stop fallback after `source_shutdown_retries`)
+- Waits for shutdown snapshot to appear on DR replication targets (count delta)
+- Waits for shutdown snapshot to reach 100% replication on DR
+- Then clones and powers on — RPO = 0 (zero data loss)
+
+**Test-only flag**: `skip_operator_confirmation=true` bypasses the YES pause.
+Never use in production — it exists only so `test_failover_live.yml` can run unattended.
 
 The failback playbook suite (`prepare → cutover → cleanup`) serves as the
 structured return path after **either** emergency or planned failover.
