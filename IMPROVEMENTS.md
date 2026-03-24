@@ -1,6 +1,8 @@
-# Improvement Backlog — Prioritized
+# Possible Improvements — Ideas and Considerations
 
-Ranked by production impact vs. implementation effort.
+These are ideas and design notes for potential future enhancements, ranked roughly by
+production impact vs. implementation effort. They are not commitments or a roadmap —
+treat them as a starting point for your own contributions or adaptations.
 
 ---
 

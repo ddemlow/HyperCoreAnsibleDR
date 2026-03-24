@@ -2,6 +2,11 @@
 
 Ansible playbook for automated disaster recovery failover on Scale Computing HyperCore.
 
+> **Disclaimer:** This project is provided as-is, without warranty of any kind. It is
+> intended as a starting point and reference implementation — test thoroughly in your own
+> environment and validate against your specific HyperCore version before relying on it
+> for production workloads.
+
 When run on a schedule, the playbook monitors the replication connection from a DR (target)
 cluster back to the primary (source) cluster. If the primary is confirmed unreachable, it
 automatically clones all replicated VMs on the DR cluster and powers them on — with no
@@ -154,7 +159,7 @@ See [Known limitations](#known-limitations).
 
 - **VM startup ordering** — VMs are powered on in arbitrary order. Applications that require
   a specific boot sequence (database before application before web tier) must be started
-  manually after failover. Ordered startup is planned as a future enhancement.
+  manually after failover. Ordered startup is a possible future enhancement.
 
 - **VM-to-source-cluster mapping** — When multiple source clusters replicate to the same DR
   cluster, there is no API-level way to determine which source cluster a replicated VM came
@@ -170,8 +175,8 @@ See [Known limitations](#known-limitations).
   automated. Manual steps are required.
 
 - **Post-failover health checks** — The playbook powers on cloned VMs but does not verify
-  that applications are responding. Adding per-VM TCP health checks after power-on is a
-  planned enhancement.
+  that applications are responding. Per-VM TCP health checks after power-on are a
+  possible future enhancement.
 
 ## Repository contents
 

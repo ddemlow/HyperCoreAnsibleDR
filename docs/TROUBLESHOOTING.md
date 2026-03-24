@@ -190,10 +190,12 @@ ansible -i inventory/inventory.yml all \
 
 ### Remote cluster shows `ESTABLISHED` but primary is actually offline
 
-The replication connection status may take **2–5 minutes** to update after a failure.
+The replication connection status may take several minutes to update after a failure.
 The HyperCore cluster reports this status based on its own heartbeat interval.
 
-Wait a few minutes and re-run. You can monitor the status change:
+The playbook handles this automatically: once pings confirm the source nodes are
+unreachable, it polls `remote_cluster_info` until the status changes before proceeding.
+You can monitor the status change manually if needed:
 ```bash
 watch -n 30 'ansible -i inventory/inventory.yml all \
   -m scale_computing.hypercore.remote_cluster_info 2>/dev/null \
@@ -218,15 +220,20 @@ Work through this checklist when the primary is genuinely down but no failover o
 
 ### Check 1: Connection status has not updated yet
 
+The playbook polls for the status change automatically after pings fail, so this should
+not block failover under normal circumstances. If failover still did not trigger, check
+the current status manually:
+
 ```bash
 ansible -i inventory/inventory.yml all \
   -m scale_computing.hypercore.remote_cluster_info \
   | grep connection_status
 ```
 
-Wait for `DISCONNECTED`. If it shows `ESTABLISHED` after 5+ minutes, the DR cluster may
-still have a path to the primary (check routing — replication may be on a separate VLAN
-that is still up even though the management network is down).
+If it still shows `ESTABLISHED` after the playbook's disconnect-detection polling
+exhausted all retries, the DR cluster may still have a path to the primary — replication
+may be on a separate VLAN that is still up even though the management network is down.
+Check routing and adjust `disconnect_detect_retries`/`disconnect_detect_delay` if needed.
 
 ### Check 2: Primary node IPs are still responding to ping
 
