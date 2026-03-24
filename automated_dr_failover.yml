@@ -271,8 +271,7 @@
         existing_dr_vms: >-
           {{ all_vms.records
              | selectattr('tags', 'defined')
-             | selectattr('tags', 'string')
-             | selectattr('tags', 'search', dr_vm_tag)
+             | selectattr('tags', 'contains', dr_vm_tag)
              | list }}
 
     - name: "[4/6] Failover already performed — {{ existing_dr_vms | length }} DR VM(s) exist, exiting"
