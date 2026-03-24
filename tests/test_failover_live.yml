@@ -108,6 +108,16 @@
     source_cluster_name: ""  # set to cluster name if desired
     http_check_host: ""      # set to non-empty to test http-check guard path
     http_check_port: 80
+    # Set auto_disconnect: true when the source cluster runs as a VM on a host cluster.
+    # The test will disconnect/reconnect source node NICs automatically instead of
+    # prompting the operator.  Override source_cluster_vm_name if the VM name on the
+    # host cluster differs from the source inventory host's hypercore_cluster_name.
+    auto_disconnect: false
+    host_cluster:
+      host: "https://vfz31a-02.lab.local"
+      username: "admin"
+      password: "admin"
+    source_cluster_vm_name: ""  # defaults to hypercore_cluster_name from source inventory
 
   tasks:
     - name: "Wait for replicated VMs to appear on DR target"
@@ -147,11 +157,57 @@
       retries: 120
       delay: 5
 
+    - name: "Resolve source cluster VM name on host cluster"
+      ansible.builtin.set_fact:
+        resolved_source_vm_name: >-
+          {{ source_cluster_vm_name
+             if source_cluster_vm_name | length > 0
+             else hostvars[groups['source'][0]]['hypercore_cluster_name'] }}
+      when: auto_disconnect | bool
+
+    - name: "Discover source cluster node VMs on host cluster"
+      scale_computing.hypercore.vm_info:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+      register: host_cluster_vms
+      when: auto_disconnect | bool
+
+    - name: "Filter to source cluster node VMs by name prefix"
+      ansible.builtin.set_fact:
+        source_node_vms: >-
+          {{ host_cluster_vms.records
+             | selectattr('vm_name', 'match', '^' + resolved_source_vm_name + '.*$')
+             | list }}
+      when: auto_disconnect | bool
+
+    - name: "Fail if no source cluster VMs found on host cluster"
+      ansible.builtin.fail:
+        msg: >-
+          No VMs matching '{{ resolved_source_vm_name }}*' found on host cluster
+          {{ host_cluster.host }}. Check host_cluster credentials and source_cluster_vm_name.
+      when: auto_disconnect | bool and (source_node_vms | default([]) | length == 0)
+
+    - name: "Disconnect NICs on source cluster node VMs to simulate outage"
+      scale_computing.hypercore.vm_nic:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+        vm_name: "{{ item.vm_name }}"
+        items: "{{ item.nics | map('combine', {'connected': false}) | list }}"
+      loop: "{{ source_node_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: auto_disconnect | bool
+
     - name: "Instruct operator to poweroff/disconnect source cluster before failover"
       ansible.builtin.pause:
         prompt: |-
           Simulate source outage now by powering off/disconnecting source cluster.
           Then press Enter to continue into automated failover.
+      when: not (auto_disconnect | bool)
 
     - name: "Wait for remote cluster connection to be detected as disconnected"
       scale_computing.hypercore.remote_cluster_info:
@@ -229,6 +285,12 @@
 
               Ready to clean up test VMs. Please reconnect/power on the source cluster now.
               Then press Enter to continue with cleanup.
+          when: not (auto_disconnect | bool)
+
+        - name: "Test passed — auto-reconnect will follow"
+          ansible.builtin.debug:
+            msg: "TEST PASSED. Reconnecting source cluster NICs and proceeding to cleanup."
+          when: auto_disconnect | bool
 
       rescue:
         - name: "Prompt user: test failed, cleanup anyway?"
@@ -237,6 +299,25 @@
               TEST FAILED: Issues detected (see output above).
               Do you want to run cleanup anyway? Please reconnect/power on the source cluster now.
               Then press Enter to continue with cleanup, or Ctrl+C to abort.
+          when: not (auto_disconnect | bool)
+
+        - name: "Test failed — auto-reconnect will follow"
+          ansible.builtin.debug:
+            msg: "TEST FAILED. See output above. Reconnecting source cluster NICs and proceeding to cleanup."
+          when: auto_disconnect | bool
+
+    - name: "Reconnect NICs on source cluster node VMs"
+      scale_computing.hypercore.vm_nic:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+        vm_name: "{{ item.vm_name }}"
+        items: "{{ item.nics | map('combine', {'connected': true}) | list }}"
+      loop: "{{ source_node_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: auto_disconnect | bool and source_node_vms is defined
 
     - name: "Wait for remote cluster connection to be re-established"
       scale_computing.hypercore.remote_cluster_info:
