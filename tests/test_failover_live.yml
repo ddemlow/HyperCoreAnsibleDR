@@ -599,6 +599,7 @@
     source_vm_prefix: "dr-live-test"
     dr_vm_tag: "DR-failover"
     source_cluster_name: ""
+    dr_exclude_tag: "dr-exclude"
 
   tasks:
     # ── Setup: clean up emergency failover clones so we get a fresh run ──────
