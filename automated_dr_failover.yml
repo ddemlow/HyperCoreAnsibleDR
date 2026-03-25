@@ -470,6 +470,7 @@
       ansible.builtin.pause:
         prompt: "Type YES (uppercase) to shut down source VMs and proceed with planned failover."
       register: planned_confirmation
+      run_once: true   # pause is incompatible with host_pinned/free strategy without run_once
       when:
         - planned_failover | bool
         - not (skip_operator_confirmation | bool)
