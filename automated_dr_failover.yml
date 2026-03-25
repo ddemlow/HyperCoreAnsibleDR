@@ -466,22 +466,16 @@
           ============================================================
       when: planned_failover | bool
 
-    - name: "[4.5/6] Planned failover — operator YES confirmation"
-      ansible.builtin.pause:
-        prompt: "Type YES (uppercase) to shut down source VMs and proceed with planned failover."
-      register: planned_confirmation
-      run_once: true   # pause is incompatible with host_pinned/free strategy without run_once
-      when:
-        - planned_failover | bool
-        - not (skip_operator_confirmation | bool)
-
-    - name: "[4.5/6] Planned failover — abort if operator did not confirm"
+    - name: "[4.5/6] Planned failover — require explicit confirmation flag"
       ansible.builtin.fail:
-        msg: "Planned failover aborted — operator did not confirm with YES."
+        msg: |
+          CONFIRMATION REQUIRED: planned_failover=true will shut down source VMs.
+          Re-run with: -e "planned_failover=true planned_confirm=true"
+          This explicit flag is required so the confirmation appears in your command history as an audit trail.
       when:
         - planned_failover | bool
+        - not (planned_confirm | default(false) | bool)
         - not (skip_operator_confirmation | bool)
-        - planned_confirmation.user_input | upper != "YES"
 
     - name: "[4.5/6] Planned failover — record pre-shutdown snapshot counts on DR replication targets"
       scale_computing.hypercore.vm_snapshot_info:
