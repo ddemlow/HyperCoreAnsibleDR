@@ -1,0 +1,730 @@
+---
+# tests/test_failback_live.yml
+#
+# Live integration test for the full DR failback workflow.
+#
+# Tests all three failback playbooks in sequence:
+#   Phase 1: automated_dr_failback_prepare.yml (conflict check + reverse replication)
+#   Phase 2: automated_dr_failback_cutover.yml (shutdown + clone + power on)
+#   Phase 3: automated_dr_failback_cleanup.yml (delete DR VMs + stubs)
+#
+# Prerequisites:
+#   - inventory/test_inventory.yml with source and dr groups configured
+#   - Two live HyperCore clusters with replication configured
+#   - auto_disconnect: true and host_cluster configured in test inventory (recommended)
+#     OR operator present to manually disconnect/reconnect source
+#
+# Usage:
+#   ansible-playbook tests/test_failback_live.yml -i inventory/test_inventory.yml
+#
+# The test first runs a failover (using automated_dr_failover.yml) to establish
+# the DR state, then exercises the full failback sequence.
+#
+# See docs/FAILBACK_DESIGN.md for full design notes.
+
+# ── Pre-flight: ensure source cluster connectivity ───────────────────────────
+
+- name: "Failback test — pre-flight: ensure source cluster connectivity"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  tasks:
+    - name: "Discover source cluster node VMs on host cluster"
+      scale_computing.hypercore.vm_info:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+      register: host_cluster_vms
+      when: auto_disconnect | bool
+
+    - name: "Filter to source cluster node VMs"
+      ansible.builtin.set_fact:
+        source_node_vms: >-
+          {{ host_cluster_vms.records
+             | selectattr('vm_name', 'match', '^' + (source_cluster_vm_name
+                if (source_cluster_vm_name | default('') | length > 0)
+                else hostvars[groups['source'][0]]['hypercore_cluster_name']) + '.*$')
+             | list }}
+      when: auto_disconnect | bool
+
+    - name: "Reconnect NIC on source cluster node VMs (no-op if already connected)"
+      ansible.builtin.uri:
+        url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ item.nics[0].uuid }}"
+        method: PATCH
+        url_username: "{{ host_cluster.username }}"
+        url_password: "{{ host_cluster.password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          connected: true
+        status_code: 200
+      loop: "{{ source_node_vms | default([]) }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: auto_disconnect | bool and (source_node_vms | default([]) | length > 0)
+
+    - name: "Wait for source cluster to be reachable"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/Cluster"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: 200
+      register: source_reachable
+      until: source_reachable.status == 200
+      retries: 24
+      delay: 5
+      when: auto_disconnect | bool and (source_node_vms | default([]) | length > 0)
+
+
+# ── Pre-test cleanup ─────────────────────────────────────────────────────────
+
+- name: "Failback test — pre-test cleanup: source cluster"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+
+  tasks:
+    - name: "Get all VMs on source"
+      scale_computing.hypercore.vm_info:
+      register: all_source_vms
+
+    - name: "Delete any existing test VMs on source"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ all_source_vms.records | selectattr('vm_name', 'match', '^' + test_vm_prefix + '.*$') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: cleanup_previous_run | default(true) | bool
+
+- name: "Failback test — pre-test cleanup: DR cluster"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+
+  tasks:
+    - name: "Get all VMs on DR"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Delete any existing test VMs on DR (replication targets and failover clones)"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ all_dr_vms.records | selectattr('vm_name', 'match', '^' + test_vm_prefix + '.*$') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: cleanup_previous_run | default(true) | bool
+
+
+# ── Setup: create test VMs and enable replication ────────────────────────────
+
+- name: "Failback test — setup: create test VMs and enable replication"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+    source_cluster_vm_name: ""
+    # Two test VMs:
+    # - dr-failback-test-keep     : goes through full failback lifecycle
+    # - dr-failback-test-conflict : will be left RUNNING on source to test the conflict path
+    test_vms:
+      - name: "dr-failback-test-keep"
+        tags: []
+      - name: "dr-failback-test-conflict"
+        tags: []
+
+  tasks:
+    - name: "Initialize test result tracking"
+      ansible.builtin.set_fact:
+        result_conflict_check: "NOT RUN"
+        result_reverse_replication: "NOT RUN"
+        result_cutover: "NOT RUN"
+        result_cleanup: "NOT RUN"
+
+    - name: "Discover remote DR cluster connection on source"
+      scale_computing.hypercore.remote_cluster_info:
+      register: source_remote_cluster_info
+
+    - name: "Fail if no remote cluster configured on source"
+      ansible.builtin.fail:
+        msg: "No remote cluster configured on source — configure replication first."
+      when: source_remote_cluster_info.records | length == 0
+
+    - name: "Resolve DR cluster name as seen from source"
+      ansible.builtin.set_fact:
+        dr_cluster_name_from_source: "{{ source_remote_cluster_info.records[0].name }}"
+
+    - name: "Create test VMs on source"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.name }}"
+        description: "DR failback live test source VM"
+        state: present
+        memory: "{{ '256 MB' | human_to_bytes }}"
+        vcpu: 1
+        operating_system: os_other
+        disks:
+          - type: virtio_disk
+            disk_slot: 0
+            size: "{{ '1 GB' | human_to_bytes }}"
+        nics:
+          - type: virtio
+            vlan: 0
+        boot_devices:
+          - type: virtio_disk
+            disk_slot: 0
+        power_state: start
+        tags: "{{ item.tags }}"
+      loop: "{{ test_vms }}"
+
+    - name: "Enable replication for test VMs to DR"
+      scale_computing.hypercore.vm_replication:
+        vm_name: "{{ item.name }}"
+        remote_cluster: "{{ dr_cluster_name_from_source }}"
+        state: enabled
+      loop: "{{ test_vms }}"
+
+
+# ── Simulated failover ────────────────────────────────────────────────────────
+
+- name: "Failback test — simulate failover (disconnect source, run failover, reconnect)"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+    source_cluster_name: ""
+    source_cluster_vm_name: ""
+
+  tasks:
+    - name: "Wait for replicated test VMs to appear on DR"
+      scale_computing.hypercore.vm_info:
+      register: dr_vm_poll
+      until: >-
+        (dr_vm_poll.records
+         | selectattr('vm_name', 'match', '^' + test_vm_prefix + '.*$')
+         | selectattr('replication_source_vm_uuid', 'ne', '')
+         | list | length) >= 2
+      retries: 60
+      delay: 10
+
+    - name: "Wait for initial replication to reach 100%"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/VirDomainReplication"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: initial_replication
+      until: >-
+        (initial_replication.json | length) >= 2 and
+        (initial_replication.json | map(attribute='progress.percentComplete') | list | min) == 100
+      retries: 120
+      delay: 5
+
+    - name: "Discover source cluster node VMs on host cluster"
+      scale_computing.hypercore.vm_info:
+        cluster_instance:
+          host: "{{ host_cluster.host }}"
+          username: "{{ host_cluster.username }}"
+          password: "{{ host_cluster.password }}"
+      register: host_cluster_vms
+      when: auto_disconnect | bool
+
+    - name: "Filter to source cluster node VMs"
+      ansible.builtin.set_fact:
+        source_node_vms: >-
+          {{ host_cluster_vms.records
+             | selectattr('vm_name', 'match', '^' + (source_cluster_vm_name
+                if (source_cluster_vm_name | length > 0)
+                else hostvars[groups['source'][0]]['hypercore_cluster_name']) + '.*$')
+             | list }}
+      when: auto_disconnect | bool
+
+    - name: "Simulate failover block: disconnect → failover → reconnect"
+      block:
+        - name: "Disconnect NIC on source cluster node VM"
+          ansible.builtin.uri:
+            url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
+            method: PATCH
+            url_username: "{{ host_cluster.username }}"
+            url_password: "{{ host_cluster.password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              connected: false
+            status_code: 200
+          when: auto_disconnect | bool
+
+        - name: "Wait for source to be detected as disconnected"
+          scale_computing.hypercore.remote_cluster_info:
+          register: remote_status
+          until: >-
+            (remote_status.records
+             | selectattr('connection_status', 'ne', 'ESTABLISHED')
+             | list | length) > 0
+          retries: 48
+          delay: 5
+
+        - name: "Run automated DR failover playbook"
+          ansible.builtin.command: >-
+            ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
+            -i {{ ansible_inventory_sources[0] }}
+            -l {{ inventory_hostname }}
+            -e "source_cluster_name={{ source_cluster_name }}"
+            -v
+          register: failover_run
+          changed_when: false
+
+        - name: "Assert failover cloned the test VMs"
+          ansible.builtin.assert:
+            that:
+              - "'DR-failover' in failover_run.stdout"
+            fail_msg: "Failover did not appear to clone any VMs. Output: {{ failover_run.stdout[-500:] }}"
+            success_msg: "Failover ran successfully."
+
+      always:
+        - name: "Reconnect NIC on source cluster node VM"
+          ansible.builtin.uri:
+            url: "{{ host_cluster.host }}/rest/v1/VirDomainNetDevice/{{ source_node_vms[0].nics[0].uuid }}"
+            method: PATCH
+            url_username: "{{ host_cluster.username }}"
+            url_password: "{{ host_cluster.password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              connected: true
+            status_code: 200
+          when: auto_disconnect | bool
+
+        - name: "Wait for source to reconnect"
+          scale_computing.hypercore.remote_cluster_info:
+          register: reconnect_status
+          until: >-
+            (reconnect_status.records
+             | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+             | list | length) > 0
+          retries: 24
+          delay: 5
+          when: auto_disconnect | bool
+
+
+# ── Phase 1 test: conflict check ─────────────────────────────────────────────
+
+- name: "Failback test — Phase 1: conflict check (rename_and_proceed)"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+    failback_prepare_playbook: "{{ playbook_dir }}/../automated_dr_failback_prepare.yml"
+
+  tasks:
+    - name: "Phase 1 conflict check test"
+      block:
+        - name: "Run prepare playbook with conflict_action=rename_and_proceed"
+          ansible.builtin.command: >-
+            ansible-playbook {{ failback_prepare_playbook }}
+            -i {{ ansible_inventory_sources[0] }}
+            -e "conflict_action=rename_and_proceed"
+            -v
+          register: prepare_run
+          changed_when: false
+
+        - name: "Show prepare run output"
+          ansible.builtin.debug:
+            msg: "{{ prepare_run.stdout[-2000:] }}"
+
+        - name: "Check source cluster for renamed conflict VM"
+          ansible.builtin.uri:
+            url: "https://{{ groups['source'][0] }}/rest/v1/VirDomain"
+            url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+            url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+            force_basic_auth: true
+            validate_certs: false
+          register: source_vms_after_prepare
+
+        - name: "Assert dr-failback-test-conflict was renamed on source"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (source_vms_after_prepare.json
+                 | selectattr('name', 'match', '^original-.*-dr-failback-test-conflict$')
+                 | list | length) >= 1
+            fail_msg: >-
+              Expected 'dr-failback-test-conflict' to have been renamed to 'original-*' pattern
+              but no such VM found on source.
+              Source VMs: {{ source_vms_after_prepare.json | map(attribute='name') | list }}
+            success_msg: "Conflict VM was correctly renamed on source."
+
+        - name: "Assert no original-named conflicts remain on source"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (source_vms_after_prepare.json
+                 | selectattr('name', 'equalto', 'dr-failback-test-conflict')
+                 | list | length) == 0
+            fail_msg: "dr-failback-test-conflict still exists on source with original name after rename."
+            success_msg: "No naming conflicts remain on source."
+
+        - name: "Assert prepare output indicates replication configured"
+          ansible.builtin.assert:
+            that:
+              - "'100%' in prepare_run.stdout or 'FAILBACK PREPARE COMPLETE' in prepare_run.stdout"
+            fail_msg: "Prepare playbook did not reach 100% replication. Output: {{ prepare_run.stdout[-500:] }}"
+            success_msg: "Reverse replication reached 100%."
+
+        - name: "Record conflict check + replication result: PASS"
+          ansible.builtin.set_fact:
+            result_conflict_check: "PASS"
+            result_reverse_replication: "PASS"
+
+      rescue:
+        - name: "Record conflict check result: FAIL"
+          ansible.builtin.set_fact:
+            result_conflict_check: "FAIL"
+            result_reverse_replication: "FAIL"
+        - name: "Re-raise failure"
+          ansible.builtin.fail:
+            msg: "Phase 1 conflict check test FAILED. See output above."
+
+
+# ── Phase 2 test: cutover ─────────────────────────────────────────────────────
+
+- name: "Failback test — Phase 2: cutover"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+    failback_cutover_playbook: "{{ playbook_dir }}/../automated_dr_failback_cutover.yml"
+
+  tasks:
+    - name: "Phase 2 cutover test"
+      block:
+        - name: "Run cutover playbook (auto-answer YES via echo)"
+          ansible.builtin.shell: >-
+            echo "YES" | ansible-playbook {{ failback_cutover_playbook }}
+            -i {{ ansible_inventory_sources[0] }}
+            -v
+          register: cutover_run
+          changed_when: false
+
+        - name: "Show cutover run output"
+          ansible.builtin.debug:
+            msg: "{{ cutover_run.stdout[-2000:] }}"
+
+        - name: "Assert DR failover VMs are now SHUTOFF"
+          scale_computing.hypercore.vm_info:
+          register: dr_vms_post_cutover
+
+        - name: "Get DR failover VMs state after cutover"
+          ansible.builtin.set_fact:
+            dr_vms_still_running: >-
+              {{ dr_vms_post_cutover.records
+                 | selectattr('tags', 'defined')
+                 | selectattr('tags', 'contains', 'DR-failover')
+                 | selectattr('power_state', 'equalto', 'RUNNING')
+                 | list }}
+
+        - name: "Assert all DR failover VMs are SHUTOFF"
+          ansible.builtin.assert:
+            that:
+              - dr_vms_still_running | length == 0
+            fail_msg: >-
+              {{ dr_vms_still_running | length }} DR failover VM(s) are still RUNNING after cutover.
+              VMs: {{ dr_vms_still_running | map(attribute='vm_name') | list }}
+            success_msg: "All DR failover VMs are SHUTOFF."
+
+        - name: "Assert source has VMs with original names in RUNNING state"
+          ansible.builtin.uri:
+            url: "https://{{ groups['source'][0] }}/rest/v1/VirDomain"
+            url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+            url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+            force_basic_auth: true
+            validate_certs: false
+          register: source_vms_post_cutover
+
+        - name: "Get running source VMs with original test names"
+          ansible.builtin.set_fact:
+            source_running_originals: >-
+              {{ source_vms_post_cutover.json
+                 | selectattr('name', 'in', ['dr-failback-test-keep', 'dr-failback-test-conflict'])
+                 | selectattr('state', 'equalto', 'RUNNING')
+                 | list }}
+
+        - name: "Assert at least dr-failback-test-keep is running on source"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (source_running_originals
+                 | selectattr('name', 'equalto', 'dr-failback-test-keep')
+                 | list | length) == 1
+            fail_msg: "dr-failback-test-keep is not RUNNING on source after cutover."
+            success_msg: "dr-failback-test-keep is RUNNING on source."
+
+        - name: "Assert cloned source VMs have no DR-failover tag"
+          ansible.builtin.set_fact:
+            source_vms_with_dr_tag: >-
+              {{ source_vms_post_cutover.json
+                 | selectattr('name', 'in', ['dr-failback-test-keep', 'dr-failback-test-conflict'])
+                 | selectattr('tags', 'defined')
+                 | selectattr('tags', 'contains', 'DR-failover')
+                 | list }}
+
+        - name: "Assert no restored source VMs have DR-failover tag"
+          ansible.builtin.assert:
+            that:
+              - source_vms_with_dr_tag | length == 0
+            fail_msg: >-
+              {{ source_vms_with_dr_tag | length }} source VM(s) still have DR-failover tag.
+              These should have been cleared during clone.
+            success_msg: "No restored source VMs have DR-failover tag."
+
+        - name: "Record cutover result: PASS"
+          ansible.builtin.set_fact:
+            result_cutover: "PASS"
+
+      rescue:
+        - name: "Record cutover result: FAIL"
+          ansible.builtin.set_fact:
+            result_cutover: "FAIL"
+        - name: "Re-raise failure"
+          ansible.builtin.fail:
+            msg: "Phase 2 cutover test FAILED. See output above."
+
+
+# ── Phase 3 test: cleanup ─────────────────────────────────────────────────────
+
+- name: "Failback test — Phase 3: cleanup"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+    failback_cleanup_playbook: "{{ playbook_dir }}/../automated_dr_failback_cleanup.yml"
+
+  tasks:
+    - name: "Phase 3 cleanup test"
+      block:
+        - name: "Run cleanup playbook (auto-answer DELETE via echo)"
+          ansible.builtin.shell: >-
+            echo "DELETE" | ansible-playbook {{ failback_cleanup_playbook }}
+            -i {{ ansible_inventory_sources[0] }}
+            -v
+          register: cleanup_run
+          changed_when: false
+
+        - name: "Show cleanup run output"
+          ansible.builtin.debug:
+            msg: "{{ cleanup_run.stdout[-2000:] }}"
+
+        - name: "Assert no DR-failover tagged VMs remain on DR"
+          scale_computing.hypercore.vm_info:
+          register: dr_vms_post_cleanup
+
+        - name: "Get remaining DR-failover tagged VMs"
+          ansible.builtin.set_fact:
+            remaining_dr_failover_vms: >-
+              {{ dr_vms_post_cleanup.records
+                 | selectattr('tags', 'defined')
+                 | selectattr('tags', 'contains', 'DR-failover')
+                 | selectattr('vm_name', 'match', '^' + test_vm_prefix + '.*$')
+                 | list }}
+
+        - name: "Assert no DR failover VMs remain"
+          ansible.builtin.assert:
+            that:
+              - remaining_dr_failover_vms | length == 0
+            fail_msg: >-
+              {{ remaining_dr_failover_vms | length }} DR failover VM(s) still exist after cleanup.
+              VMs: {{ remaining_dr_failover_vms | map(attribute='vm_name') | list }}
+            success_msg: "All DR failover VMs deleted from DR cluster."
+
+        - name: "Assert no -DR suffix VMs remain on source"
+          ansible.builtin.uri:
+            url: "https://{{ groups['source'][0] }}/rest/v1/VirDomain"
+            url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+            url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+            force_basic_auth: true
+            validate_certs: false
+          register: source_vms_post_cleanup
+
+        - name: "Get -DR suffix VMs remaining on source"
+          ansible.builtin.set_fact:
+            remaining_dr_stubs: >-
+              {{ source_vms_post_cleanup.json
+                 | selectattr('name', 'match', '^' + test_vm_prefix + '.*-DR$')
+                 | list }}
+
+        - name: "Assert no -DR suffix stub VMs remain on source"
+          ansible.builtin.assert:
+            that:
+              - remaining_dr_stubs | length == 0
+            fail_msg: >-
+              {{ remaining_dr_stubs | length }} -DR suffix stub VM(s) still exist on source.
+              VMs: {{ remaining_dr_stubs | map(attribute='name') | list }}
+            success_msg: "All -DR suffix stub VMs deleted from source."
+
+        - name: "Assert original-named source VMs still running"
+          ansible.builtin.set_fact:
+            source_vms_still_running: >-
+              {{ source_vms_post_cleanup.json
+                 | selectattr('name', 'equalto', 'dr-failback-test-keep')
+                 | selectattr('state', 'equalto', 'RUNNING')
+                 | list }}
+
+        - name: "Assert test-keep VM is still RUNNING on source after cleanup"
+          ansible.builtin.assert:
+            that:
+              - source_vms_still_running | length == 1
+            fail_msg: "dr-failback-test-keep is not RUNNING on source after cleanup."
+            success_msg: "Original source VMs are still running after cleanup."
+
+        - name: "Record cleanup result: PASS"
+          ansible.builtin.set_fact:
+            result_cleanup: "PASS"
+
+      rescue:
+        - name: "Record cleanup result: FAIL"
+          ansible.builtin.set_fact:
+            result_cleanup: "FAIL"
+        - name: "Re-raise failure"
+          ansible.builtin.fail:
+            msg: "Phase 3 cleanup test FAILED. See output above."
+
+
+# ── Teardown ──────────────────────────────────────────────────────────────────
+
+- name: "Failback test — teardown: source cluster"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+
+  tasks:
+    - name: "Get all VMs on source for teardown"
+      scale_computing.hypercore.vm_info:
+      register: teardown_source_vms
+
+    - name: "Delete all test VMs on source (original names and renamed conflicts)"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: >-
+        {{ teardown_source_vms.records
+           | selectattr('vm_name', 'match', '^(' + test_vm_prefix + '|original-[0-9].*-' + test_vm_prefix + ').*$')
+           | list }}
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+- name: "Failback test — teardown: DR cluster"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    test_vm_prefix: "dr-failback-test"
+
+  tasks:
+    - name: "Get all VMs on DR for teardown"
+      scale_computing.hypercore.vm_info:
+      register: teardown_dr_vms
+
+    - name: "Delete all test VMs on DR"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ teardown_dr_vms.records | selectattr('vm_name', 'match', '^' + test_vm_prefix + '.*$') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+
+- name: "Failback test — final summary"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  tasks:
+    - name: "Print final test summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          DR FAILBACK LIVE TEST — FINAL SUMMARY
+          ============================================================
+          Conflict check (rename_and_proceed):     {{ result_conflict_check    | default('NOT RUN') }}
+          Reverse replication (DR → source 100%):  {{ result_reverse_replication | default('NOT RUN') }}
+          Cutover (shutdown + clone + power on):   {{ result_cutover           | default('NOT RUN') }}
+          Cleanup (delete DR VMs + source stubs):  {{ result_cleanup           | default('NOT RUN') }}
+          ------------------------------------------------------------
+          Overall: {{ 'PASS' if (
+            result_conflict_check     | default('') == 'PASS' and
+            result_reverse_replication | default('') == 'PASS' and
+            result_cutover            | default('') == 'PASS' and
+            result_cleanup            | default('') == 'PASS'
+          ) else 'FAIL' }}
+          ============================================================
+
+    - name: "Fail play if any test phase failed"
+      ansible.builtin.fail:
+        msg: "One or more failback test phases failed. See summary above."
+      when: >-
+        result_conflict_check     | default('') != 'PASS' or
+        result_reverse_replication | default('') != 'PASS' or
+        result_cutover            | default('') != 'PASS' or
+        result_cleanup            | default('') != 'PASS'

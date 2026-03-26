@@ -231,6 +231,8 @@
         result_guard_check: "NOT RUN"
         result_failover: "NOT RUN"
         result_idempotency: "NOT RUN"
+        result_planned_failover: "NOT RUN"
+        result_planned_zero_rpo: "NOT RUN"
 
     - name: "Wait for replicated VMs to appear on DR target"
       scale_computing.hypercore.vm_info:
@@ -307,12 +309,13 @@
     - name: "Guard check — run failover playbook while source is still online (must be a no-op)"
       block:
         - name: "Run failover playbook with source cluster reachable"
-          ansible.builtin.command: >-
+          ansible.builtin.shell: >-
             ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
             -i {{ ansible_inventory_sources[0] }}
             -l {{ inventory_hostname }}
             -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
             -v
+            2>&1 | tee /tmp/guard_run_test.log
           register: guard_run
           changed_when: false
 
@@ -397,12 +400,13 @@
           delay: 5
 
         - name: "Run automated DR failover playbook"
-          ansible.builtin.command: >-
+          ansible.builtin.shell: >-
             ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
             -i {{ ansible_inventory_sources[0] }}
             -l {{ inventory_hostname }}
             -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
             -v
+            2>&1 | tee /tmp/failover_run_test.log
           register: failover_run
           changed_when: false
 
@@ -476,12 +480,13 @@
         - name: "Idempotency check — re-run failover playbook with DR VMs already present"
           block:
             - name: "Re-run automated DR failover playbook (should be a no-op)"
-              ansible.builtin.command: >-
+              ansible.builtin.shell: >-
                 ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
                 -i {{ ansible_inventory_sources[0] }}
                 -l {{ inventory_hostname }}
                 -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
                 -v
+                2>&1 | tee /tmp/idempotency_run_test.log
               register: idempotency_run
               changed_when: false
 
@@ -583,6 +588,231 @@
           delay: 5
           when: auto_disconnect | bool
 
+- name: "DR failover live integration test - planned failover test"
+  hosts: dr
+  connection: local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    source_vm_prefix: "dr-live-test"
+    dr_vm_tag: "DR-failover"
+    source_cluster_name: ""
+    dr_exclude_tag: "dr-exclude"
+
+  tasks:
+    # ── Setup: clean up emergency failover clones so we get a fresh run ──────
+
+    - name: "Planned test setup — remove DR failover clones from emergency test"
+      scale_computing.hypercore.vm_info:
+      register: dr_vms_pre_planned
+
+    - name: "Planned test setup — delete DR failover clone VMs"
+      scale_computing.hypercore.vm:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: >-
+        {{ dr_vms_pre_planned.records
+           | selectattr('tags', 'defined')
+           | selectattr('tags', 'contains', dr_vm_tag)
+           | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$')
+           | list }}
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    - name: "Planned test setup — wait for source replication to re-sync to 100%"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/VirDomainReplication"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: pre_planned_replication
+      until: >-
+        (pre_planned_replication.json | length) >= 1 and
+        (pre_planned_replication.json | map(attribute='progress.percentComplete') | list | min) == 100
+      retries: 120
+      delay: 5
+
+    # ── Baseline: record snapshot counts before planned failover ─────────────
+
+    - name: "Planned test — get DR replication target VMs"
+      scale_computing.hypercore.vm_info:
+      register: dr_vms_for_planned
+
+    - name: "Planned test — filter to replication targets (non-tagged, have source UUID)"
+      ansible.builtin.set_fact:
+        planned_test_dr_targets: >-
+          {{ dr_vms_for_planned.records
+             | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$')
+             | selectattr('replication_source_vm_uuid', 'ne', '')
+             | rejectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+
+    - name: "Planned test — record pre-run snapshot counts on DR targets"
+      scale_computing.hypercore.vm_snapshot_info:
+        vm_name: "{{ item.vm_name }}"
+      register: planned_pre_snapshots
+      loop: "{{ planned_test_dr_targets }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+
+    - name: "Planned test — build pre-snapshot count map"
+      ansible.builtin.set_fact:
+        planned_pre_snapshot_counts: >-
+          {{ planned_pre_snapshot_counts | default({})
+             | combine({item.item.vm_name: item.records | length}) }}
+      loop: "{{ planned_pre_snapshots.results }}"
+      loop_control:
+        label: "{{ item.item.vm_name }}"
+
+    # ── Run planned failover ──────────────────────────────────────────────────
+
+    - name: "Planned failover test"
+      block:
+        - name: "Run planned failover playbook (skip_operator_confirmation=true for automation)"
+          ansible.builtin.shell: >-
+            ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
+            -i {{ ansible_inventory_sources[0] }}
+            -l {{ inventory_hostname }}
+            -e "planned_failover=true skip_operator_confirmation=true source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }}"
+            -v
+            2>&1 | tee /tmp/planned_failover_test.log
+          register: planned_run
+          changed_when: false
+
+        - name: "Show planned failover output"
+          ansible.builtin.debug:
+            msg: "{{ planned_run.stdout[-2000:] }}"
+
+        # ── Assert: DR failover clone VMs were created ────────────────────────
+
+        - name: "Get DR VMs after planned failover"
+          scale_computing.hypercore.vm_info:
+          register: dr_vms_after_planned
+
+        - name: "Analyze planned failover clones"
+          ansible.builtin.set_fact:
+            planned_cloned_keep_vms: >-
+              {{ dr_vms_after_planned.records
+                 | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-keep.*-DR$')
+                 | list }}
+            planned_cloned_exclude_vms: >-
+              {{ dr_vms_after_planned.records
+                 | selectattr('vm_name', 'match', '^' + source_vm_prefix + '-exclude.*-DR$')
+                 | list }}
+
+        - name: "Fail if planned failover did not clone expected VMs"
+          ansible.builtin.fail:
+            msg: >-
+              PLANNED FAILOVER FAILED: Expected at least 1 clone of '{{ source_vm_prefix }}-keep'
+              but found {{ planned_cloned_keep_vms | length }}.
+          when: planned_cloned_keep_vms | length == 0
+
+        - name: "Fail if excluded VM was cloned during planned failover"
+          ansible.builtin.fail:
+            msg: >-
+              PLANNED FAILOVER FAILED: Excluded VM was cloned when it should have been skipped.
+              Clones found: {{ planned_cloned_exclude_vms | map(attribute='vm_name') | list }}
+          when: planned_cloned_exclude_vms | length > 0
+
+        - name: "Record planned failover result: PASS"
+          ansible.builtin.set_fact:
+            result_planned_failover: "PASS"
+
+        # ── Assert: source VMs are SHUTOFF (zero-RPO gate) ───────────────────
+
+        - name: "Assert source VMs were shut down during planned failover"
+          scale_computing.hypercore.vm_info:
+            vm_name: "{{ item }}"
+            cluster_instance:
+              host: "https://{{ groups['source'][0] }}"
+              username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+              password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+          register: source_vm_states
+          loop:
+            - "{{ source_vm_prefix }}-keep"
+          loop_control:
+            label: "{{ item }}"
+
+        - name: "Fail if any source VM is still started after planned failover"
+          ansible.builtin.fail:
+            msg: >-
+              ZERO-RPO CHECK FAILED: Source VM '{{ item.item }}' is still
+              {{ item.records[0].power_state | default('UNKNOWN') }} — expected stopped.
+              Planned failover must have skipped the graceful shutdown step.
+          loop: "{{ source_vm_states.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          when:
+            - item.records | length > 0
+            - item.records[0].power_state == 'started'
+
+        # ── Assert: shutdown snapshot appeared (zero-RPO proxy) ──────────────
+
+        - name: "Get snapshot counts after planned failover"
+          scale_computing.hypercore.vm_snapshot_info:
+            vm_name: "{{ item.vm_name }}"
+          register: planned_post_snapshots
+          loop: "{{ planned_test_dr_targets }}"
+          loop_control:
+            label: "{{ item.vm_name }}"
+
+        - name: "Fail if no new snapshot appeared after planned shutdown"
+          ansible.builtin.fail:
+            msg: >-
+              ZERO-RPO CHECK FAILED: No new snapshot detected on DR target '{{ item.item.vm_name }}'
+              after planned failover shutdown.
+              Pre-run count: {{ planned_pre_snapshot_counts[item.item.vm_name] | default(0) }}
+              Post-run count: {{ item.records | length }}
+          loop: "{{ planned_post_snapshots.results }}"
+          loop_control:
+            label: "{{ item.item.vm_name }}"
+          when: (item.records | length) <= (planned_pre_snapshot_counts[item.item.vm_name] | default(0) | int)
+
+        - name: "Record planned zero-RPO result: PASS"
+          ansible.builtin.set_fact:
+            result_planned_zero_rpo: "PASS"
+
+        - name: "Report planned failover test result"
+          ansible.builtin.debug:
+            msg: |
+              ============================================
+              PLANNED FAILOVER TEST RESULT: PASS
+              ============================================
+              DR clones created: {{ planned_cloned_keep_vms | length }} (excluded: {{ planned_cloned_exclude_vms | length }})
+              Source VMs: stopped ✓
+              Shutdown snapshot detected on DR targets ✓
+              ============================================
+
+      rescue:
+        - name: "Record planned failover failure"
+          ansible.builtin.set_fact:
+            result_planned_failover: "{{ result_planned_failover if result_planned_failover == 'PASS' else 'FAIL' }}"
+            result_planned_zero_rpo: "{{ result_planned_zero_rpo if result_planned_zero_rpo == 'PASS' else 'FAIL' }}"
+        - name: "Re-raise planned failover test failure"
+          ansible.builtin.fail:
+            msg: "Planned failover test FAILED. See output above."
+
+      always:
+        - name: "Power on source VMs after planned failover test (they were shut down)"
+          scale_computing.hypercore.vm_params:
+            vm_name: "{{ item }}"
+            power_state: start
+            cluster_instance:
+              host: "https://{{ groups['source'][0] }}"
+              username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+              password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+          loop:
+            - "{{ source_vm_prefix }}-keep"
+            - "{{ source_vm_prefix }}-exclude"
+          ignore_errors: true
+
+
 - name: "DR failover live integration test - cleanup source test VMs"
   hosts: source
   connection: local
@@ -656,18 +886,28 @@
           ============================================================
           DR FAILOVER LIVE TEST — FINAL SUMMARY
           ============================================================
-          Guard check (no-op while source online): {{ result_guard_check | default('NOT RUN') }}
-          Failover (clone + power on):             {{ result_failover    | default('NOT RUN') }}
-          Idempotency (re-run must be no-op):      {{ result_idempotency | default('NOT RUN') }}
+          Guard check (no-op while source online):    {{ result_guard_check      | default('NOT RUN') }}
+          Emergency failover (clone + power on):      {{ result_failover         | default('NOT RUN') }}
+          Idempotency (re-run must be no-op):         {{ result_idempotency      | default('NOT RUN') }}
+          Planned failover (source shutdown + clone): {{ result_planned_failover | default('NOT RUN') }}
+          Zero-RPO assertion (shutdown snapshot):     {{ result_planned_zero_rpo | default('NOT RUN') }}
           ------------------------------------------------------------
-          Overall: {{ 'PASS' if (result_guard_check | default('') == 'PASS' and result_failover | default('') == 'PASS' and result_idempotency | default('') == 'PASS') else 'FAIL' }}
+          Overall: {{ 'PASS' if (
+            result_guard_check      | default('') == 'PASS' and
+            result_failover         | default('') == 'PASS' and
+            result_idempotency      | default('') == 'PASS' and
+            result_planned_failover | default('') == 'PASS' and
+            result_planned_zero_rpo | default('') == 'PASS'
+          ) else 'FAIL' }}
           ============================================================
 
     - name: "Fail play if any test phase failed"
       ansible.builtin.fail:
         msg: "One or more test phases failed. See summary above."
       when: >-
-        result_guard_check | default('') != 'PASS' or
-        result_failover    | default('') != 'PASS' or
-        result_idempotency | default('') != 'PASS'
+        result_guard_check      | default('') != 'PASS' or
+        result_failover         | default('') != 'PASS' or
+        result_idempotency      | default('') != 'PASS' or
+        result_planned_failover | default('') != 'PASS' or
+        result_planned_zero_rpo | default('') != 'PASS'
 

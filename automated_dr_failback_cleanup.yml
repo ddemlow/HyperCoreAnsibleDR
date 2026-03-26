@@ -1,0 +1,346 @@
+---
+# automated_dr_failback_cleanup.yml
+#
+# DR Failback — Phase 5: permanent deletion of DR failover VMs and source replication stubs.
+#
+# Run ONLY after:
+#   1. automated_dr_failback_cutover.yml has completed successfully
+#   2. Operator has verified all applications on the source cluster are healthy
+#
+# This playbook is IRREVERSIBLE. Operator must type "DELETE" to confirm.
+#
+# Usage:
+#   ansible-playbook automated_dr_failback_cleanup.yml -i inventory/inventory.yml
+#
+# See docs/FAILBACK_DESIGN.md for full design notes.
+
+# ── Play 1: Safety verification ───────────────────────────────────────────────
+
+- name: "Failback Cleanup — safety verification"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+    require_operator_confirmation: true
+
+  tasks:
+    - name: "Get all VMs on DR cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Filter to DR failover VMs to be deleted"
+      ansible.builtin.set_fact:
+        dr_failover_vms: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+
+    - name: "Fail if no DR failover VMs found"
+      ansible.builtin.fail:
+        msg: >-
+          No VMs tagged '{{ dr_vm_tag }}' found on DR cluster {{ inventory_hostname }}.
+          Failback cleanup may have already run, or failover was never performed.
+      when: dr_failover_vms | length == 0
+
+    - name: "Build list of original names (to verify on source)"
+      ansible.builtin.set_fact:
+        expected_source_names: >-
+          {{ dr_failover_vms
+             | map(attribute='vm_name')
+             | map('regex_replace', dr_name_suffix_regex, '\\1')
+             | list }}
+
+    - name: "Cross-cluster verify original-named source VMs exist and are RUNNING"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/VirDomain"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: source_vm_check
+
+    - name: "Build sets: source VMs found, running, and missing"
+      ansible.builtin.set_fact:
+        source_vms_found: >-
+          {{ source_vm_check.json
+             | selectattr('name', 'in', expected_source_names)
+             | list }}
+        source_vms_running: >-
+          {{ source_vm_check.json
+             | selectattr('name', 'in', expected_source_names)
+             | selectattr('state', 'equalto', 'RUNNING')
+             | list }}
+        source_vms_missing: >-
+          {{ expected_source_names
+             | reject('in', source_vm_check.json | map(attribute='name') | list)
+             | list }}
+        source_vms_not_running: >-
+          {{ source_vm_check.json
+             | selectattr('name', 'in', expected_source_names)
+             | rejectattr('state', 'equalto', 'RUNNING')
+             | list }}
+
+    - name: "Display safety verification report"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          FAILBACK CLEANUP — SAFETY VERIFICATION
+          ============================================================
+          DR failover VMs to DELETE (IRREVERSIBLE):
+          {% for vm in dr_failover_vms %}
+          - {{ vm.vm_name }} ({{ vm.power_state }})
+          {% endfor %}
+
+          Source VMs verified RUNNING:
+          {% if source_vms_running | length > 0 %}
+          {% for vm in source_vms_running %}
+          - {{ vm.name }} ✓
+          {% endfor %}
+          {% else %}
+            None
+          {% endif %}
+
+          Source VMs NOT running (unexpected):
+          {% if source_vms_not_running | length > 0 %}
+          {% for vm in source_vms_not_running %}
+          - {{ vm.name }} ({{ vm.state }}) ← PROBLEM
+          {% endfor %}
+          {% else %}
+            None
+          {% endif %}
+
+          Source VMs MISSING entirely (unexpected):
+          {% if source_vms_missing | length > 0 %}
+          {% for name in source_vms_missing %}
+          - {{ name }} ← PROBLEM
+          {% endfor %}
+          {% else %}
+            None
+          {% endif %}
+          ============================================================
+
+    - name: "ABORT if any source VM is missing — something is wrong"
+      ansible.builtin.fail:
+        msg: >-
+          SAFETY ABORT: The following VMs are expected on source but NOT FOUND:
+          {{ source_vms_missing | join(', ') }}
+
+          Do NOT run cleanup until all source VMs exist and are RUNNING.
+          Check whether the cutover playbook completed successfully.
+      when: source_vms_missing | length > 0
+
+    - name: "ABORT if any source VM is not RUNNING — something is wrong"
+      ansible.builtin.fail:
+        msg: >-
+          SAFETY ABORT: The following VMs exist on source but are NOT RUNNING:
+          {{ source_vms_not_running | map(attribute='name') | list | join(', ') }}
+
+          Do NOT run cleanup until all source VMs are confirmed RUNNING and healthy.
+          The DR failover VMs are your rollback option — do not delete them until
+          source is verified.
+      when: source_vms_not_running | length > 0
+
+    - name: "Operator DELETE confirmation (irreversible)"
+      ansible.builtin.pause:
+        prompt: |
+          ALL SAFETY CHECKS PASSED.
+
+          You are about to PERMANENTLY DELETE:
+          - {{ dr_failover_vms | length }} DR failover VM(s) on {{ inventory_hostname }}
+          - Source replication stub VMs with -DR suffix (deleted in Play 3)
+
+          This action is IRREVERSIBLE.
+
+          Source VMs verified RUNNING: {{ source_vms_running | map(attribute='name') | list | join(', ') }}
+
+          Type DELETE (uppercase) to proceed. Anything else aborts.
+      register: delete_confirmation
+      when: require_operator_confirmation | bool
+
+    - name: "Abort if operator did not type DELETE"
+      ansible.builtin.fail:
+        msg: "Cleanup aborted — operator did not confirm with DELETE."
+      when:
+        - require_operator_confirmation | bool
+        - delete_confirmation.user_input | upper != "DELETE"
+
+
+# ── Play 2: Delete DR failover VMs ───────────────────────────────────────────
+
+- name: "Failback Cleanup — delete DR failover VMs"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+
+  tasks:
+    - name: "Get DR failover VMs"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Filter to DR failover VMs"
+      ansible.builtin.set_fact:
+        dr_failover_vms: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+
+    - name: "Force stop any DR failover VMs still running (should be SHUTOFF post-cutover)"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.vm_name }}"
+        power_state: stop
+      loop: "{{ dr_failover_vms | selectattr('power_state', 'equalto', 'RUNNING') | list }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: (dr_failover_vms | selectattr('power_state', 'equalto', 'RUNNING') | list | length) > 0
+
+    - name: "Disable reverse replication before deletion"
+      scale_computing.hypercore.vm_replication:
+        vm_name: "{{ item.vm_name }}"
+        state: absent
+      loop: "{{ dr_failover_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      ignore_errors: true
+
+    - name: "Delete DR failover VMs"
+      block:
+        - name: "Delete each DR failover VM"
+          scale_computing.hypercore.vm:
+            vm_name: "{{ item.vm_name }}"
+            state: absent
+          loop: "{{ dr_failover_vms }}"
+          loop_control:
+            label: "{{ item.vm_name }}"
+          register: delete_dr_results
+
+      rescue:
+        - name: "Report DR VM deletion failures"
+          ansible.builtin.debug:
+            msg: |
+              DR VM deletion failures:
+              {% for result in delete_dr_results.results | default([]) %}
+              {% if result.failed %}
+              - FAILED: {{ result.item.vm_name }}: {{ result.msg | default('unknown error') }}
+              {% endif %}
+              {% endfor %}
+        - name: "Fail after reporting deletion errors"
+          ansible.builtin.fail:
+            msg: "One or more DR failover VM deletions failed. See output above."
+
+    - name: "Verify DR failover VMs are gone"
+      scale_computing.hypercore.vm_info:
+      register: dr_vms_after_delete
+
+    - name: "Display DR cleanup result"
+      ansible.builtin.debug:
+        msg: >-
+          DR failover VMs deleted: {{ dr_failover_vms | length }}.
+          Remaining tagged VMs on DR: {{
+            dr_vms_after_delete.records
+            | selectattr('tags', 'defined')
+            | selectattr('tags', 'contains', dr_vm_tag)
+            | list | length }}.
+
+
+# ── Play 3: Delete source replication stub VMs ───────────────────────────────
+
+- name: "Failback Cleanup — delete source replication stub VMs"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+
+  tasks:
+    - name: "Get all VMs on source cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_source_vms
+
+    - name: "Find -DR suffix replication stub VMs on source"
+      ansible.builtin.set_fact:
+        source_stub_vms: >-
+          {{ all_source_vms.records
+             | selectattr('vm_name', 'match', dr_name_suffix_regex)
+             | list }}
+
+    - name: "Display stubs to be deleted"
+      ansible.builtin.debug:
+        msg: |
+          Source replication stub VMs to delete: {{ source_stub_vms | length }}
+          (These are the -DR suffix VMs created by reverse replication, NOT the restored originals)
+          {% for vm in source_stub_vms %}
+          - {{ vm.vm_name }} ({{ vm.power_state }})
+          {% endfor %}
+
+    - name: "Skip if no stubs found"
+      ansible.builtin.debug:
+        msg: "No -DR suffix replication stub VMs found on source. Nothing to clean up."
+      when: source_stub_vms | length == 0
+
+    - name: "Delete -DR suffix replication stub VMs on source"
+      block:
+        - name: "Delete each source replication stub"
+          scale_computing.hypercore.vm:
+            vm_name: "{{ item.vm_name }}"
+            state: absent
+          loop: "{{ source_stub_vms }}"
+          loop_control:
+            label: "{{ item.vm_name }}"
+          register: delete_stub_results
+          when: source_stub_vms | length > 0
+
+      rescue:
+        - name: "Report stub deletion failures"
+          ansible.builtin.debug:
+            msg: |
+              Source stub deletion failures:
+              {% for result in delete_stub_results.results | default([]) %}
+              {% if result.failed %}
+              - FAILED: {{ result.item.vm_name }}: {{ result.msg | default('unknown error') }}
+              {% endif %}
+              {% endfor %}
+        - name: "Fail after reporting stub deletion errors"
+          ansible.builtin.fail:
+            msg: "One or more source replication stub deletions failed. See output above."
+
+    - name: "Final summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          FAILBACK COMPLETE
+          ============================================================
+          DR failover VMs deleted from DR cluster.
+          Source replication stub VMs ({{ source_stub_vms | length }}) deleted from source.
+
+          Your workloads are now running on the source cluster with original VM names.
+          Forward replication (source → DR) was re-enabled during cutover.
+
+          NEXT STEPS:
+          - Verify forward replication is ESTABLISHED and progressing toward 100%
+          - Monitor replication health to ensure RPO is being met
+          - The DR cluster is now ready for the next failover event
+          ============================================================

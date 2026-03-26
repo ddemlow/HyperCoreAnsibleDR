@@ -1,0 +1,507 @@
+---
+# automated_dr_failback_prepare.yml
+#
+# DR Failback — Phase 1-3: conflict check, reverse replication, sync monitoring.
+#
+# Run after the source cluster has been restored and is fully online.
+# Re-runnable: if reverse replication is already configured and at 100%, exits cleanly.
+#
+# Usage:
+#   ansible-playbook automated_dr_failback_prepare.yml -i inventory/inventory.yml
+#
+# Override conflict handling:
+#   -e "conflict_action=rename_and_proceed"   # rename conflicting source VMs and proceed
+#   -e "conflict_action=abort"                # (default) stop if any conflict found
+#
+# See docs/FAILBACK_DESIGN.md for full design notes.
+
+# ── Pre-play: collect DR failover VM list ────────────────────────────────────
+
+- name: "Failback Prepare — collect DR failover VMs"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+
+  tasks:
+    - name: "Get all VMs on DR cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Filter to DR failover VMs (tagged DR-failover)"
+      ansible.builtin.set_fact:
+        dr_failover_vms: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+
+    - name: "Fail if no DR failover VMs found"
+      ansible.builtin.fail:
+        msg: >-
+          No VMs tagged '{{ dr_vm_tag }}' found on DR cluster {{ inventory_hostname }}.
+          Failover may not have run, or VMs may have already been cleaned up.
+      when: dr_failover_vms | length == 0
+
+    # dr_failover_vm_map is a list of vm dicts each with an extra 'original_name' key.
+    # Stored as a fact so the source play can read it via hostvars.
+    - name: "Build original-name mapping for DR failover VMs"
+      ansible.builtin.set_fact:
+        dr_failover_vm_map: >-
+          {{ dr_failover_vms
+             | map('combine', {'original_name':
+                 item.vm_name | regex_replace(dr_name_suffix_regex, '\1')})
+             | list }}
+      loop: "{{ dr_failover_vms }}"
+      loop_control:
+        loop_var: item
+
+    - name: "Display DR failover VMs and their original names"
+      ansible.builtin.debug:
+        msg: |
+          DR failover VMs found: {{ dr_failover_vms | length }}
+          {% for vm in dr_failover_vms %}
+          - {{ vm.vm_name }} → {{ vm.vm_name | regex_replace(dr_name_suffix_regex, '\1') }}
+          {% endfor %}
+
+
+# ── Phase 1: Source conflict check ───────────────────────────────────────────
+
+- name: "Failback Prepare — Phase 1: source conflict check"
+  hosts: source
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+    conflict_action: "abort"      # "abort" or "rename_and_proceed"
+    rename_prefix: "original"
+    graceful_shutdown_retries: 30
+    graceful_shutdown_delay: 10
+
+  tasks:
+    - name: "Receive DR failover VM map from DR host"
+      ansible.builtin.set_fact:
+        dr_failover_vm_map: "{{ hostvars[groups['dr'][0]]['dr_failover_vm_map'] }}"
+
+    - name: "Fail if DR failover VM map is empty"
+      ansible.builtin.fail:
+        msg: "No DR failover VM map received from DR cluster play. Did the pre-play fail?"
+      when: dr_failover_vm_map | length == 0
+
+    - name: "Build list of original names expected on source"
+      ansible.builtin.set_fact:
+        expected_original_names: "{{ dr_failover_vm_map | map(attribute='original_name') | list }}"
+
+    - name: "Get all VMs on source cluster"
+      scale_computing.hypercore.vm_info:
+      register: all_source_vms
+
+    - name: "Identify conflicting VMs on source (names match expected original names)"
+      ansible.builtin.set_fact:
+        running_conflicts: >-
+          {{ all_source_vms.records
+             | selectattr('vm_name', 'in', expected_original_names)
+             | selectattr('power_state', 'equalto', 'RUNNING')
+             | list }}
+        stopped_conflicts: >-
+          {{ all_source_vms.records
+             | selectattr('vm_name', 'in', expected_original_names)
+             | rejectattr('power_state', 'equalto', 'RUNNING')
+             | list }}
+
+    - name: "Display conflict report"
+      ansible.builtin.debug:
+        msg: |
+          Conflict check on source cluster {{ inventory_hostname }}:
+          -------------------------------------------------------
+          DR VMs to failback: {{ dr_failover_vm_map | length }}
+          Original names expected on source: {{ expected_original_names | join(', ') }}
+
+          Running conflicts (source VMs with same name that are RUNNING):
+          {% if running_conflicts | length == 0 %}
+            None
+          {% else %}
+            {% for vm in running_conflicts %}
+            - {{ vm.vm_name }} ({{ vm.power_state }})
+            {% endfor %}
+          {% endif %}
+
+          Stopped conflicts (source VMs with same name that are NOT running):
+          {% if stopped_conflicts | length == 0 %}
+            None
+          {% else %}
+            {% for vm in stopped_conflicts %}
+            - {{ vm.vm_name }} ({{ vm.power_state }})
+            {% endfor %}
+          {% endif %}
+
+    - name: "Abort if conflicts found and conflict_action is 'abort'"
+      ansible.builtin.fail:
+        msg: >-
+          CONFLICT DETECTED: The following VMs already exist on the source cluster with the
+          same names as the DR failover VMs:
+          Running: {{ running_conflicts | map(attribute='vm_name') | list | join(', ') | default('none') }}
+          Stopped: {{ stopped_conflicts | map(attribute='vm_name') | list | join(', ') | default('none') }}
+
+          These may be old/stale VMs from before the outage, or the cluster may not have
+          been fully cleaned up. Review and either delete/rename them manually, or re-run
+          with: -e "conflict_action=rename_and_proceed"
+
+          conflict_action=rename_and_proceed will:
+          - Gracefully shut down running conflicts
+          - Rename all conflicts to: {{ rename_prefix }}-TIMESTAMP-<name>
+      when:
+        - conflict_action == "abort"
+        - (running_conflicts | length + stopped_conflicts | length) > 0
+
+    - name: "Operator pause before shutting down and renaming conflicting VMs"
+      ansible.builtin.pause:
+        prompt: |
+          conflict_action=rename_and_proceed selected.
+
+          The following source VMs will be SHUT DOWN and RENAMED:
+          Running: {{ running_conflicts | map(attribute='vm_name') | list | join(', ') | default('none') }}
+          Stopped: {{ stopped_conflicts | map(attribute='vm_name') | list | join(', ') | default('none') }}
+
+          They will be renamed to: {{ rename_prefix }}-<TIMESTAMP>-<original-name>
+
+          WARNING: These VMs contain data from BEFORE the original outage. Verify this
+          data is not needed or has been backed up before proceeding.
+
+          Press Enter to continue or Ctrl+C to abort.
+      when:
+        - conflict_action == "rename_and_proceed"
+        - (running_conflicts | length + stopped_conflicts | length) > 0
+
+    - name: "Gracefully shut down running conflict VMs"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.vm_name }}"
+        power_state: shutdown
+      loop: "{{ running_conflicts }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when:
+        - conflict_action == "rename_and_proceed"
+        - running_conflicts | length > 0
+
+    - name: "Wait for running conflicts to reach SHUTOFF"
+      scale_computing.hypercore.vm_info:
+        vm_name: "{{ item.vm_name }}"
+      register: graceful_results
+      until: graceful_results.records[0].power_state == 'SHUTOFF'
+      retries: "{{ graceful_shutdown_retries }}"
+      delay: "{{ graceful_shutdown_delay }}"
+      loop: "{{ running_conflicts }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when:
+        - conflict_action == "rename_and_proceed"
+        - running_conflicts | length > 0
+      ignore_errors: true
+
+    - name: "Force stop any conflicts that did not shut down gracefully"
+      scale_computing.hypercore.vm_params:
+        vm_name: "{{ item.item.vm_name }}"
+        power_state: stop
+      loop: "{{ graceful_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.vm_name | default('unknown') }}"
+      when:
+        - conflict_action == "rename_and_proceed"
+        - item.failed is defined and item.failed
+      ignore_errors: true
+
+    - name: "Set rename timestamp"
+      ansible.builtin.set_fact:
+        rename_timestamp: "{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
+      when:
+        - conflict_action == "rename_and_proceed"
+        - (running_conflicts | length + stopped_conflicts | length) > 0
+
+    - name: "Rename conflicting VMs via REST PATCH"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomain/{{ item.uuid }}"
+        method: PATCH
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          name: "{{ rename_prefix }}-{{ rename_timestamp }}-{{ item.vm_name }}"
+        status_code: 200
+      loop: "{{ running_conflicts + stopped_conflicts }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when:
+        - conflict_action == "rename_and_proceed"
+        - (running_conflicts | length + stopped_conflicts | length) > 0
+
+    - name: "Re-query source VMs and assert no conflicts remain"
+      scale_computing.hypercore.vm_info:
+      register: source_vms_after_rename
+      when:
+        - conflict_action == "rename_and_proceed"
+        - (running_conflicts | length + stopped_conflicts | length) > 0
+
+    - name: "Build remaining conflict list"
+      ansible.builtin.set_fact:
+        remaining_conflicts: >-
+          {{ source_vms_after_rename.records
+             | selectattr('vm_name', 'in', expected_original_names)
+             | list }}
+      when:
+        - conflict_action == "rename_and_proceed"
+        - source_vms_after_rename is defined
+
+    - name: "Fail if conflicts still remain after rename"
+      ansible.builtin.fail:
+        msg: >-
+          Conflicts still remain on source after rename attempt:
+          {{ remaining_conflicts | map(attribute='vm_name') | list | join(', ') }}
+          Check the REST PATCH tasks above for errors.
+      when:
+        - conflict_action == "rename_and_proceed"
+        - remaining_conflicts is defined
+        - remaining_conflicts | length > 0
+
+    - name: "Display conflict resolution result"
+      ansible.builtin.debug:
+        msg: >-
+          Conflict check complete.
+          {% if (running_conflicts | length + stopped_conflicts | length) == 0 %}
+          No conflicts found — source is clean, ready for reverse replication.
+          {% else %}
+          {{ running_conflicts | length + stopped_conflicts | length }} conflict(s) renamed.
+          Source is now clean, ready for reverse replication.
+          {% endif %}
+
+
+# ── Phase 2-3: Reverse replication setup and progress monitoring ─────────────
+
+- name: "Failback Prepare — Phase 2-3: reverse replication and sync"
+  hosts: dr
+  connection: ansible.builtin.local
+  gather_facts: false
+
+  environment:
+    SC_HOST: "https://{{ inventory_hostname }}"
+    SC_USERNAME: "{{ scale_user | default('admin') }}"
+    SC_PASSWORD: "{{ scale_pass | default('admin') }}"
+
+  vars:
+    dr_vm_tag: "DR-failover"
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
+    replication_poll_retries: 360    # 360 × 10s = 1 hour
+    replication_poll_delay: 10
+    source_remote_cluster_name: ""   # resolved dynamically if empty
+
+  tasks:
+    - name: "Verify source cluster connection is ESTABLISHED"
+      scale_computing.hypercore.remote_cluster_info:
+      register: remote_cluster_status
+
+    - name: "Fail if source cluster is not ESTABLISHED"
+      ansible.builtin.fail:
+        msg: >-
+          Source cluster connection is not ESTABLISHED from DR cluster {{ inventory_hostname }}.
+          Current status: {{ remote_cluster_status.records | map(attribute='connection_status') | list }}
+          Ensure the source cluster is fully online before running failback prepare.
+      when: >-
+        (remote_cluster_status.records
+         | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+         | list | length) == 0
+
+    - name: "Resolve source cluster name as seen from DR (first ESTABLISHED remote cluster)"
+      ansible.builtin.set_fact:
+        resolved_source_cluster_name: >-
+          {{ source_remote_cluster_name
+             if source_remote_cluster_name | length > 0
+             else (remote_cluster_status.records
+                   | selectattr('connection_status', 'equalto', 'ESTABLISHED')
+                   | map(attribute='name') | first) }}
+
+    - name: "Get DR failover VMs"
+      scale_computing.hypercore.vm_info:
+      register: all_dr_vms
+
+    - name: "Filter to DR failover VMs (tagged DR-failover)"
+      ansible.builtin.set_fact:
+        dr_failover_vms: >-
+          {{ all_dr_vms.records
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', dr_vm_tag)
+             | list }}
+
+    - name: "Fail if no DR failover VMs found"
+      ansible.builtin.fail:
+        msg: "No VMs tagged '{{ dr_vm_tag }}' found on DR cluster."
+      when: dr_failover_vms | length == 0
+
+    - name: "Check current replication status for idempotency"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: current_replication
+
+    - name: "Build list of DR VM UUIDs"
+      ansible.builtin.set_fact:
+        dr_failover_vm_uuids: "{{ dr_failover_vms | map(attribute='uuid') | list }}"
+
+    - name: "Check if all DR failover VMs already have reverse replication at 100%"
+      ansible.builtin.set_fact:
+        replication_already_complete: >-
+          {{ (current_replication.json
+              | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+              | list | length) == (dr_failover_vms | length)
+             and
+             (current_replication.json
+              | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+              | map(attribute='progress.percentComplete')
+              | list | min | default(0)) == 100 }}
+
+    - name: "Display current state and replication status"
+      ansible.builtin.debug:
+        msg: |
+          Failback Prepare — Reverse Replication Setup
+          =============================================
+          DR cluster: {{ inventory_hostname }}
+          Source cluster (remote name from DR): {{ resolved_source_cluster_name }}
+          DR failover VMs: {{ dr_failover_vms | length }}
+          Replication already at 100%: {{ replication_already_complete }}
+
+          VMs to configure reverse replication for:
+          {% for vm in dr_failover_vms %}
+          - {{ vm.vm_name }}
+            → original name: {{ vm.vm_name | regex_replace(dr_name_suffix_regex, '\1') }}
+            → power state: {{ vm.power_state }}
+          {% endfor %}
+
+    - name: "Exit early — all reverse replication already at 100% (idempotent re-run)"
+      ansible.builtin.debug:
+        msg: >-
+          All {{ dr_failover_vms | length }} DR failover VMs already have reverse replication
+          configured and at 100%. Failback prepare is complete. Ready to run cutover playbook.
+      when: replication_already_complete | bool
+
+    - name: "Operator confirmation before enabling reverse replication"
+      ansible.builtin.pause:
+        prompt: |
+          Ready to enable reverse replication from DR → source for {{ dr_failover_vms | length }} VM(s).
+
+          Source cluster: {{ resolved_source_cluster_name }}
+
+          This will begin replicating DR VMs back to the source cluster. This may take a
+          long time depending on how much data has changed since the failover.
+
+          The playbook will wait until all VMs reach 100% before exiting.
+          You can safely Ctrl+C and re-run; it will pick up where it left off.
+
+          Press Enter to continue or Ctrl+C to abort.
+      when: not (replication_already_complete | bool)
+
+    - name: "Enable reverse replication for each DR failover VM"
+      scale_computing.hypercore.vm_replication:
+        vm_name: "{{ item.vm_name }}"
+        remote_cluster: "{{ resolved_source_cluster_name }}"
+        state: enabled
+      loop: "{{ dr_failover_vms }}"
+      loop_control:
+        label: "{{ item.vm_name }}"
+      when: not (replication_already_complete | bool)
+      register: replication_setup_results
+
+    - name: "Wait for replication target VMs to appear on source (cross-cluster URI poll)"
+      ansible.builtin.uri:
+        url: "https://{{ groups['source'][0] }}/rest/v1/VirDomain"
+        url_username: "{{ hostvars[groups['source'][0]]['scale_user'] | default('admin') }}"
+        url_password: "{{ hostvars[groups['source'][0]]['scale_pass'] | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: source_vm_poll
+      until: >-
+        (source_vm_poll.json
+         | selectattr('name', 'match', dr_name_suffix_regex)
+         | list | length) >= (dr_failover_vms | length)
+      retries: 60
+      delay: 10
+      when: not (replication_already_complete | bool)
+
+    - name: "Show initial replication progress"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: initial_progress
+      when: not (replication_already_complete | bool)
+
+    - name: "Display initial replication progress"
+      ansible.builtin.debug:
+        msg: |
+          Initial reverse replication progress:
+          {% for rep in (initial_progress.json | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids) | list) %}
+          - UUID {{ rep.virDomainUUID }}: {{ rep.progress.percentComplete }}%
+          {% endfor %}
+          Polling for completion (up to {{ replication_poll_retries * replication_poll_delay // 60 }} minutes)...
+      when: not (replication_already_complete | bool)
+
+    - name: "Poll until all DR failover VMs reach 100% reverse replication"
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
+        url_username: "{{ scale_user | default('admin') }}"
+        url_password: "{{ scale_pass | default('admin') }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: replication_progress_poll
+      until: >-
+        (replication_progress_poll.json
+         | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+         | list | length) == (dr_failover_vms | length)
+        and
+        (replication_progress_poll.json
+         | selectattr('virDomainUUID', 'in', dr_failover_vm_uuids)
+         | map(attribute='progress.percentComplete')
+         | list | min | default(0)) == 100
+      retries: "{{ replication_poll_retries }}"
+      delay: "{{ replication_poll_delay }}"
+      when: not (replication_already_complete | bool)
+
+    - name: "Display replication completion summary"
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          FAILBACK PREPARE COMPLETE
+          ============================================================
+          All {{ dr_failover_vms | length }} DR failover VMs have reached 100%
+          reverse replication to source cluster.
+
+          VMs ready for failback:
+          {% for vm in dr_failover_vms %}
+          - {{ vm.vm_name }}
+            → will be restored as: {{ vm.vm_name | regex_replace(dr_name_suffix_regex, '\1') }}
+          {% endfor %}
+
+          NEXT STEP: When you are ready to complete the failback (this causes a
+          service outage on DR), run:
+            ansible-playbook automated_dr_failback_cutover.yml -i inventory/inventory.yml
+          ============================================================
