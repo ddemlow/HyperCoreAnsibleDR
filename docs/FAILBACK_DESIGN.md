@@ -83,14 +83,14 @@ planned_replication_retries: 120    # × 10s = 20 min
 
 The failover playbook names DR clones as:
 ```
-<original-name>-YYYY-MM-DD_HHMM-DR
+<original-name>-YYYY-MM-DD-HHMM-DR
 ```
 
 Example: `web-01` → `web-01-2024-06-15_1430-DR`
 
 Stripping regex (used in every failback playbook):
 ```yaml
-dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 ```
 
 In Jinja2:
@@ -134,7 +134,7 @@ collisions of the *original* name only; the `-DR` suffix replication targets don
 
 ```yaml
 dr_vm_tag: "DR-failover"
-dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 # credentials from inventory: scale_user / scale_pass
 ```
 

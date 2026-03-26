@@ -73,7 +73,7 @@ Tag two VMs on the DR cluster before starting:
 - Phase 2: all node pings fail after retries
 - Phase 3: DR cluster nodes all respond
 - Phase 4: finds replicated VMs, no existing DR-tagged VMs
-- Phase 5: clones each replicated VM with `-YYYY-MM-DD_HHMM-DR` suffix
+- Phase 5: clones each replicated VM with `-YYYY-MM-DD-HHMM-DR` suffix
 - Phase 6: powers on each cloned VM
 - Summary block shows correct counts
 - Exit code 0

@@ -112,11 +112,11 @@ Critical: `vm_info` returns `tags` as a **list**, not a string. Always use:
 
 ### DR VM naming convention
 
-Failover clones are named: `<original-name>-YYYY-MM-DD_HHMM-DR`
+Failover clones are named: `<original-name>-YYYY-MM-DD-HHMM-DR`
 
 Strip regex (used everywhere):
 ```yaml
-dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 ```
 
 In Jinja2: `{{ vm.vm_name | regex_replace('^(.*)-\\d{4}-\\d{2}-\\d{2}_\\d{4}-DR$', '\\1') }}`

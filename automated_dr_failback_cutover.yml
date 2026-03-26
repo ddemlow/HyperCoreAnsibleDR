@@ -28,7 +28,7 @@
 
   vars:
     dr_vm_tag: "DR-failover"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 
   tasks:
     - name: "Verify source cluster connection is ESTABLISHED"
@@ -175,7 +175,7 @@
 
   vars:
     dr_vm_tag: "DR-failover"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
     graceful_shutdown_retries: 30
     graceful_shutdown_delay: 10
     force_stop_after_graceful: true
@@ -323,7 +323,7 @@
 
   vars:
     dr_vm_tag: "DR-failover"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 
   tasks:
     - name: "Get all VMs on source cluster"
@@ -466,7 +466,7 @@
     SC_PASSWORD: "{{ scale_pass | default('admin') }}"
 
   vars:
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
     restore_replication_enabled: true
 
   tasks:
@@ -524,7 +524,7 @@
   gather_facts: false
 
   vars:
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 
   tasks:
     - name: "Print cutover summary"

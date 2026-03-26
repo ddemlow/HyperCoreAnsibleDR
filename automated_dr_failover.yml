@@ -586,7 +586,7 @@
     # PHASE 5 + 6: Clone then power on
     # block/rescue reports partial failures cleanly rather than
     # aborting mid-way and leaving an inconsistent state.
-    # Name format: <source-name>-YYYY-MM-DD_HHMM-DR
+    # Name format: <source-name>-YYYY-MM-DD-HHMM-DR
     # =========================================================
 
     - name: "Clone and power on DR VMs"
@@ -595,7 +595,7 @@
         - name: "[5/6] Clone replicated VMs for DR failover"
           scale_computing.hypercore.vm_clone:
             source_vm_name: "{{ item.vm_name }}"
-            vm_name: "{{ item.vm_name }}-{{ '%Y-%m-%d_%H%M' | strftime }}-DR"
+            vm_name: "{{ item.vm_name }}-{{ '%Y-%m-%d-%H%M' | strftime }}-DR"
             preserve_mac_address: true
             tags:
               - "{{ dr_vm_tag }}"

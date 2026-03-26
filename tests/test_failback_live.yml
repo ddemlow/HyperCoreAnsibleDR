@@ -435,7 +435,7 @@
 
   vars:
     test_vm_prefix: "dr-failback-test"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
     failback_cutover_playbook: "{{ playbook_dir }}/../automated_dr_failback_cutover.yml"
 
   tasks:
@@ -542,7 +542,7 @@
 
   vars:
     test_vm_prefix: "dr-failback-test"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
     failback_cleanup_playbook: "{{ playbook_dir }}/../automated_dr_failback_cleanup.yml"
 
   tasks:

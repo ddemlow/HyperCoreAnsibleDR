@@ -29,7 +29,7 @@
 
   vars:
     dr_vm_tag: "DR-failover"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
 
   tasks:
     - name: "Get all VMs on DR cluster"
@@ -87,7 +87,7 @@
 
   vars:
     dr_vm_tag: "DR-failover"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
     conflict_action: "abort"      # "abort" or "rename_and_proceed"
     rename_prefix: "original"
     graceful_shutdown_retries: 30
@@ -306,7 +306,7 @@
 
   vars:
     dr_vm_tag: "DR-failover"
-    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}_\d{4}-DR$'
+    dr_name_suffix_regex: '^(.*)-\d{4}-\d{2}-\d{2}-\d{4}-DR$'
     replication_poll_retries: 360    # 360 × 10s = 1 hour
     replication_poll_delay: 10
     source_remote_cluster_name: ""   # resolved dynamically if empty
