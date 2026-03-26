@@ -309,12 +309,13 @@
     - name: "Guard check — run failover playbook while source is still online (must be a no-op)"
       block:
         - name: "Run failover playbook with source cluster reachable"
-          ansible.builtin.command: >-
+          ansible.builtin.shell: >-
             ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
             -i {{ ansible_inventory_sources[0] }}
             -l {{ inventory_hostname }}
             -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
             -v
+            2>&1 | tee /tmp/guard_run_test.log
           register: guard_run
           changed_when: false
 
@@ -399,12 +400,13 @@
           delay: 5
 
         - name: "Run automated DR failover playbook"
-          ansible.builtin.command: >-
+          ansible.builtin.shell: >-
             ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
             -i {{ ansible_inventory_sources[0] }}
             -l {{ inventory_hostname }}
             -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
             -v
+            2>&1 | tee /tmp/failover_run_test.log
           register: failover_run
           changed_when: false
 
@@ -478,12 +480,13 @@
         - name: "Idempotency check — re-run failover playbook with DR VMs already present"
           block:
             - name: "Re-run automated DR failover playbook (should be a no-op)"
-              ansible.builtin.command: >-
+              ansible.builtin.shell: >-
                 ansible-playbook {{ playbook_dir }}/../automated_dr_failover.yml
                 -i {{ ansible_inventory_sources[0] }}
                 -l {{ inventory_hostname }}
                 -e "source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }} http_check_host={{ http_check_host }} http_check_port={{ http_check_port }}"
                 -v
+                2>&1 | tee /tmp/idempotency_run_test.log
               register: idempotency_run
               changed_when: false
 
@@ -678,6 +681,7 @@
             -l {{ inventory_hostname }}
             -e "planned_failover=true skip_operator_confirmation=true source_cluster_name={{ source_cluster_name }} dr_exclude_tag={{ dr_exclude_tag }}"
             -v
+            2>&1 | tee /tmp/planned_failover_test.log
           register: planned_run
           changed_when: false
 
