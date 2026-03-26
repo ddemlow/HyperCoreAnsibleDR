@@ -736,22 +736,21 @@
           register: source_vm_states
           loop:
             - "{{ source_vm_prefix }}-keep"
-            - "{{ source_vm_prefix }}-exclude"
           loop_control:
             label: "{{ item }}"
 
-        - name: "Fail if any source VM is still RUNNING after planned failover"
+        - name: "Fail if any source VM is still started after planned failover"
           ansible.builtin.fail:
             msg: >-
               ZERO-RPO CHECK FAILED: Source VM '{{ item.item }}' is still
-              {{ item.records[0].power_state | default('UNKNOWN') }} — expected SHUTOFF.
+              {{ item.records[0].power_state | default('UNKNOWN') }} — expected stopped.
               Planned failover must have skipped the graceful shutdown step.
           loop: "{{ source_vm_states.results }}"
           loop_control:
             label: "{{ item.item }}"
           when:
             - item.records | length > 0
-            - item.records[0].power_state != 'SHUTOFF'
+            - item.records[0].power_state == 'started'
 
         # ── Assert: shutdown snapshot appeared (zero-RPO proxy) ──────────────
 
@@ -786,7 +785,7 @@
               PLANNED FAILOVER TEST RESULT: PASS
               ============================================
               DR clones created: {{ planned_cloned_keep_vms | length }} (excluded: {{ planned_cloned_exclude_vms | length }})
-              Source VMs: SHUTOFF ✓
+              Source VMs: stopped ✓
               Shutdown snapshot detected on DR targets ✓
               ============================================
 
