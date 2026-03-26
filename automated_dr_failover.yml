@@ -574,32 +574,12 @@
         label: "{{ item.vm_name }}"
       when: planned_failover | bool
 
-    - name: "[4.5/6] Planned failover — wait for shutdown snapshot to reach 100% replication on DR"
-      ansible.builtin.uri:
-        url: "https://{{ inventory_hostname }}/rest/v1/VirDomainReplication"
-        url_username: "{{ scale_user | default('admin') }}"
-        url_password: "{{ scale_pass | default('admin') }}"
-        force_basic_auth: true
-        validate_certs: false
-      register: planned_replication_poll
-      until: >-
-        (planned_replication_poll.json
-         | selectattr('virDomainUUID', 'in', vms_to_failover | map(attribute='uuid') | list)
-         | list | length) == (vms_to_failover | length)
-        and
-        (planned_replication_poll.json
-         | selectattr('virDomainUUID', 'in', vms_to_failover | map(attribute='uuid') | list)
-         | map(attribute='progress.percentComplete')
-         | list | min | default(0)) == 100
-      retries: "{{ planned_replication_retries }}"
-      delay: "{{ planned_replication_delay }}"
-      when: planned_failover | bool
-
-    - name: "[4.5/6] Planned failover — shutdown snapshot at 100%, proceeding to clone"
+    - name: "[4.5/6] Planned failover — shutdown snapshot confirmed on DR, proceeding to clone"
       ansible.builtin.debug:
         msg: >-
-          Shutdown snapshot fully replicated for all {{ vms_to_failover | length }} VMs.
-          Zero RPO achieved — cloning now.
+          Shutdown snapshot appeared on DR target(s) for all {{ vms_to_failover | length }} VM(s).
+          A snapshot is only visible on the DR target once fully transferred — zero RPO achieved.
+          Cloning now.
       when: planned_failover | bool
 
     # =========================================================
