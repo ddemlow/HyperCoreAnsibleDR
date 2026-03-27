@@ -644,13 +644,14 @@
       scale_computing.hypercore.vm_info:
       register: dr_vms_for_planned
 
-    - name: "Planned test — filter to replication targets (non-tagged, have source UUID)"
+    - name: "Planned test — filter to replication targets (exclude dr-exclude and DR-failover tagged VMs)"
       ansible.builtin.set_fact:
         planned_test_dr_targets: >-
           {{ dr_vms_for_planned.records
              | selectattr('vm_name', 'match', '^' + source_vm_prefix + '.*$')
              | selectattr('replication_source_vm_uuid', 'ne', '')
              | rejectattr('tags', 'contains', dr_vm_tag)
+             | rejectattr('tags', 'contains', dr_exclude_tag)
              | list }}
 
     - name: "Planned test — record pre-run snapshot counts on DR targets"
